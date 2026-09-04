@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shorts Maker &mdash; Sign in</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Shorts Maker</h1>
+    <p class="tagline">Sign in to continue, or create an account if you're new.</p>
+  </header>
+
+  <main>
+    <section class="card" id="auth-card" style="max-width:420px;margin:0 auto;">
+      <div class="tabs">
+        <button class="tab active" data-mode="login">Sign in</button>
+        <button class="tab" data-mode="signup">Sign up</button>
+      </div>
+
+      <label for="username">Username</label>
+      <input id="username" type="text" autocomplete="username" />
+
+      <label for="password" style="margin-top:12px;">Password</label>
+      <input id="password" type="password" autocomplete="current-password" />
+
+      <label style="margin-top:8px;display:flex;align-items:center;gap:6px;font-weight:normal;">
+        <input type="checkbox" id="show-password" style="width:auto;" />
+        Show password
+      </label>
+
+      <p id="password-strength" class="hint" style="display:none;"></p>
+
+      <button id="submit-btn" style="margin-top:20px;">Sign in</button>
+      <p id="auth-error" class="hint" style="color:#ff9fae;"></p>
+    </section>
+  </main>
+
+  <script src="/login.js"></script>
+</body>
+</html>

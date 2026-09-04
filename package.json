@@ -1,0 +1,25 @@
+{
+  "name": "shorts-maker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.19.0",
+    "googleapis": "^178.0.0",
+    "multer": "^2.3.0",
+    "node-wav": "^0.0.2",
+    "openai": "^4.55.0",
+    "uuid": "^9.0.1"
+  },
+  "optionalDependencies": {
+    "@tensorflow/tfjs-node": "^4.20.0",
+    "@vladmandic/face-api": "^1.7.15",
+    "canvas": "^2.11.2"
+  }
+}

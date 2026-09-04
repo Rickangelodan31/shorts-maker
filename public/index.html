@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shorts Maker</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div id="account-bar">
+      <span id="account-username"></span>
+      <button id="logout-btn" class="link-btn">Log out</button>
+    </div>
+    <h1>Shorts Maker</h1>
+    <p class="tagline">Turn one long video into up to 10 vertical shorts &mdash; AI picks the highlight moments and how long each one should be.</p>
+  </header>
+
+  <main>
+    <section class="card" id="accounts-card">
+      <h2>Connected accounts</h2>
+      <p class="hint">Connect a platform to post finished clips straight from here.</p>
+      <div id="accounts-grid" class="accounts-grid"></div>
+    </section>
+
+    <section class="card" id="input-card">
+      <div class="tabs">
+        <button class="tab active" data-tab="url">Paste a URL</button>
+        <button class="tab" data-tab="upload">Upload a file</button>
+      </div>
+
+      <div class="tab-panel" data-panel="url">
+        <label for="url-input">YouTube / Twitch / Kick VOD URL</label>
+        <input id="url-input" type="text" placeholder="https://..." />
+        <p class="hint">Only use videos you own or have the rights to clip &mdash; downloading from these platforms can violate their terms of service otherwise.</p>
+      </div>
+
+      <div class="tab-panel hidden" data-panel="upload">
+        <label for="file-input">Video file</label>
+        <input id="file-input" type="file" accept="video/*" />
+      </div>
+
+      <div class="options-row">
+        <div class="option">
+          <label for="caption-theme">Captions</label>
+          <select id="caption-theme">
+            <option value="none">Off</option>
+            <option value="bold">Bold Karaoke</option>
+            <option value="clean">Clean Subtitle</option>
+            <option value="meme">Meme Caps</option>
+          </select>
+        </div>
+        <div class="option checkbox-option">
+          <label for="emoji-toggle"><input id="emoji-toggle" type="checkbox" checked /> Add emojis</label>
+        </div>
+      </div>
+
+      <div class="options-row">
+        <div class="option checkbox-option">
+          <label for="pacing-toggle"><input id="pacing-toggle" type="checkbox" /> Tighten pacing (cut dead air/filler for a snappier edit)</label>
+        </div>
+      </div>
+
+      <button id="generate-btn">Generate Shorts</button>
+    </section>
+
+    <section class="card hidden" id="status-card">
+      <div class="spinner"></div>
+      <p id="status-message">Working...</p>
+      <div class="progress-bar hidden" id="status-progress-wrap"><div class="progress-fill" id="status-progress"></div></div>
+    </section>
+
+    <section class="card hidden" id="results-card">
+      <h2>Your shorts</h2>
+      <p class="hint">Each card fills in as it renders &mdash; length is chosen per moment, auto-cropped to 9:16. Use "Generate another moment" for more beyond the first batch.</p>
+      <div id="results-grid" class="results-grid"></div>
+    </section>
+
+    <section class="card hidden" id="error-card">
+      <p id="error-message"></p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
