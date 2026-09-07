@@ -116,7 +116,7 @@ function isVideoAvailable() {
 // verified-working path; the rest of the scene's visual context (location, other characters)
 // is carried in the text prompt instead. Returns {buffer, contentType} ready for blob.js,
 // mirroring generateReferenceImage's return shape.
-async function generateSceneVideo({ prompt, tier = 'lite', durationSec = 6, aspectRatio = '9:16', referenceImage = null }) {
+async function generateSceneVideo({ prompt, tier = 'lite', durationSec = 25, aspectRatio = '9:16', referenceImage = null }) {
   if (!isVideoAvailable()) {
     throw new Error(
       'Video generation requires direct Google access (GOOGLE_GENERATIVE_AI_API_KEY) — the Vercel AI ' +
