@@ -231,4 +231,9 @@ async function analyzeAudio(videoPath, tmpWavPath) {
   return computeEnergyTimeline(tmpWavPath);
 }
 
-module.exports = { analyzeAudio, bestWindow, bestWindows, findHighlightClips, computeEnergyTimeline };
+module.exports = {
+  analyzeAudio, bestWindow, bestWindows, findHighlightClips, computeEnergyTimeline,
+  // Purely additive exports (no behavior change) so visualscan.js can reuse the same
+  // pause-snapping boundary logic instead of duplicating it.
+  nearestPauseSnap, nextPauseAfter,
+};

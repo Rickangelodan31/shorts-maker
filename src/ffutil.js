@@ -1,4 +1,4 @@
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 
 // ffmpeg-full (installed via `brew install ffmpeg-full`) adds libass/freetype/fontconfig
@@ -9,6 +9,17 @@ const FULL_PROBE = '/opt/homebrew/opt/ffmpeg-full/bin/ffprobe';
 const FFMPEG_BIN = fs.existsSync(FULL_BIN) ? FULL_BIN : 'ffmpeg';
 const FFPROBE_BIN = fs.existsSync(FULL_PROBE) ? FULL_PROBE : 'ffprobe';
 const HAS_CAPTIONS = fs.existsSync(FULL_BIN);
+
+// Feature-detected once at startup (not OS-sniffed) — a build compiled without VideoToolbox
+// (Linux/Windows, or a minimal ffmpeg) simply won't list the encoder, so this degrades to
+// software encoding automatically everywhere except a real macOS+VideoToolbox build.
+let HAS_VIDEOTOOLBOX = false;
+try {
+  const out = execFileSync(FFMPEG_BIN, ['-hide_banner', '-encoders'], { timeout: 5000 }).toString();
+  HAS_VIDEOTOOLBOX = /h264_videotoolbox/.test(out);
+} catch (err) {
+  HAS_VIDEOTOOLBOX = false;
+}
 
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -77,14 +88,19 @@ async function extractAudioWav(inputPath, outPath) {
   ]);
 }
 
-async function extractFrame(inputPath, timeSec, outPath) {
-  await run(FFMPEG_BIN, [
-    '-y', '-ss', String(timeSec), '-i', inputPath,
-    '-frames:v', '1', '-q:v', '3', outPath,
-  ]);
+// opts.maxWidth: downscale the extracted frame (preserving aspect) before writing it out.
+// Face detection needs real resolution (small/far faces), so callers doing that leave this
+// unset; a vision-LLM call sent at 'low' detail is downsampled internally anyway, so
+// requesting a small proxy here avoids decoding/encoding a full-resolution JPEG for no
+// benefit.
+async function extractFrame(inputPath, timeSec, outPath, opts = {}) {
+  const args = ['-y', '-ss', String(timeSec), '-i', inputPath];
+  if (opts.maxWidth) args.push('-vf', `scale='min(${opts.maxWidth},iw)':-2`);
+  args.push('-frames:v', '1', '-q:v', '3', outPath);
+  await run(FFMPEG_BIN, args);
 }
 
 module.exports = {
   run, runWithProgress, probe, extractAudioWav, extractFrame,
-  FFMPEG_BIN, FFPROBE_BIN, HAS_CAPTIONS,
+  FFMPEG_BIN, FFPROBE_BIN, HAS_CAPTIONS, HAS_VIDEOTOOLBOX,
 };

@@ -215,6 +215,18 @@ main {
 .checkbox-option label { display: flex; align-items: center; gap: 8px; color: var(--text); margin-bottom: 0; font-size: 0.9rem; }
 .checkbox-option input { width: 16px; height: 16px; }
 
+.dimension-row { display: flex; align-items: center; gap: 8px; }
+.dimension-row input {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0e1016;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+.dimension-row span { color: var(--muted); }
+
 .progress-bar {
   width: 100%;
   height: 6px;
@@ -279,9 +291,11 @@ main {
 
 .result-item video {
   width: 100%;
+  max-height: 70vh;
   border-radius: 8px;
   background: black;
-  aspect-ratio: 9 / 16;
+  /* No fixed aspect-ratio: output size is now user-configurable, so let the video size
+     itself from its own intrinsic dimensions once metadata loads. */
 }
 
 .result-item .label {
@@ -363,6 +377,109 @@ main {
 .more-btn:hover { color: var(--text); border-color: var(--accent); }
 .more-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.actions-row {
+  display: flex;
+  gap: 8px;
+}
+.actions-row a, .actions-row button {
+  flex: 1;
+}
+.edit-layout-btn {
+  display: block;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--border);
+  color: var(--text);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.edit-layout-btn:hover { background: var(--accent); border-color: var(--accent); }
+
+.editor-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #0a0c11;
+  text-align: left;
+}
+
+.timeline-bar {
+  position: relative;
+  height: 40px;
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: visible;
+}
+
+.timeline-block {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.85;
+  border: 2px solid transparent;
+}
+.timeline-block:hover { opacity: 1; }
+.timeline-block.selected { border-color: var(--text); opacity: 1; }
+.timeline-block.type-full { background: #3a4a6b; }
+.timeline-block.type-split { background: #2b6b5e; }
+.timeline-block.type-reactor { background: #6b2b4d; }
+.timeline-block.type-content { background: #6b5a2b; }
+
+.timeline-handle {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  width: 8px;
+  margin-left: -4px;
+  background: var(--accent);
+  border-radius: 4px;
+  cursor: ew-resize;
+  z-index: 2;
+}
+
+.editor-controls { margin-top: 8px; }
+.split-here-btn, .editor-cancel-btn, .editor-save-btn, .delete-segment-btn, .type-btn, .nudge-btn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.split-here-btn:hover, .editor-cancel-btn:hover, .editor-save-btn:hover, .delete-segment-btn:hover, .type-btn:hover, .nudge-btn:hover {
+  border-color: var(--accent);
+}
+.type-btn.active { background: var(--accent); border-color: var(--accent); }
+.type-btn:disabled, .nudge-btn:disabled, .delete-segment-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.inspector { margin-top: 10px; min-height: 32px; }
+.inspector-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-bottom: 8px;
+}
+.type-switcher { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+
+.nudge-group { display: inline-block; margin: 6px 12px 6px 0; vertical-align: top; }
+.nudge-label { font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
+.nudge-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; max-width: 180px; }
+
+.editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.editor-save-btn { background: var(--accent); border-color: var(--accent); }
+
 .length-group-title {
   grid-column: 1 / -1;
   color: var(--muted);
@@ -372,3 +489,244 @@ main {
   letter-spacing: 0.04em;
 }
 .length-group-title:first-child { margin-top: 0; }
+
+/* --- AI Cartoon & Story Studio --- */
+
+.app-tabs { display: flex; justify-content: center; gap: 8px; margin-top: 18px; }
+.app-tab {
+  padding: 10px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.app-tab.active { background: var(--accent); border-color: var(--accent); color: var(--text); }
+.app-panel.hidden { display: none; }
+
+.cartoon-projects-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 12px; }
+.cartoon-project-tile {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  background: #0e1016;
+  cursor: pointer;
+}
+.cartoon-project-tile:hover { border-color: var(--accent); }
+.cartoon-project-name { font-weight: 600; }
+.cartoon-project-meta { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+
+.cartoon-new-project-row { display: flex; gap: 8px; margin-top: 16px; }
+.cartoon-new-project-row input {
+  flex: 1;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0e1016;
+  color: var(--text);
+}
+.cartoon-new-project-row button, #cartoon-generate-btn, #cartoon-save-settings-btn {
+  padding: 10px 18px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.cartoon-workspace-header { display: flex; justify-content: space-between; align-items: center; }
+
+.cartoon-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 16px 0; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+.cartoon-tab {
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.cartoon-tab.active { background: var(--panel); color: var(--text); border-color: var(--accent); }
+.cartoon-tab-panel.hidden { display: none; }
+
+.cartoon-mode-row { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.cartoon-mode-btn {
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.cartoon-mode-btn.active { background: var(--accent-2); border-color: var(--accent-2); color: var(--text); }
+
+#cartoon-idea-input, .cartoon-edit-instruction, .cartoon-scene-instruction, #cartoon-style-custom {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0e1016;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  margin: 6px 0 12px;
+}
+
+.cartoon-generating { display: flex; align-items: center; gap: 10px; margin-top: 10px; color: var(--muted); font-size: 0.85rem; }
+.cartoon-generating .mini-spinner { width: 20px; height: 20px; }
+
+.cartoon-library-toolbar { display: flex; gap: 8px; margin-bottom: 14px; }
+.cartoon-library-toolbar input {
+  flex: 1;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #0e1016;
+  color: var(--text);
+}
+.cartoon-library-toolbar button, .cartoon-back-btn { white-space: nowrap; }
+
+.cartoon-library-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.cartoon-entity-card { background: #0e1016; border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.cartoon-entity-image { width: 100%; aspect-ratio: 1 / 1; border-radius: 8px; overflow: hidden; background: #000; margin-bottom: 8px; }
+.cartoon-entity-image img { width: 100%; height: 100%; object-fit: cover; }
+.cartoon-entity-noimage { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 0.8rem; }
+.cartoon-entity-name {
+  width: 100%;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.cartoon-entity-meta { color: var(--muted); font-size: 0.78rem; margin-bottom: 8px; }
+.cartoon-lock-row { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--muted); margin-bottom: 8px; }
+.cartoon-entity-actions { display: flex; gap: 6px; }
+.cartoon-small-btn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+.cartoon-small-btn:hover { border-color: var(--accent); }
+.cartoon-edit-panel { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.cartoon-edit-row { display: flex; gap: 6px; margin-bottom: 6px; }
+.cartoon-edit-row select { flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+
+.cartoon-episode-card { border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; background: #0e1016; }
+.cartoon-episode-header { display: flex; justify-content: space-between; align-items: center; }
+.cartoon-lyrics { background: var(--panel); border-radius: 8px; padding: 10px; font-size: 0.85rem; margin: 10px 0; line-height: 1.6; }
+.cartoon-scenes-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.cartoon-scene-card { border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: var(--bg); }
+.cartoon-scene-header { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.cartoon-scene-meta { color: var(--muted); font-size: 0.78rem; }
+.cartoon-scene-body p { margin: 4px 0; font-size: 0.88rem; }
+.cartoon-scene-actions { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.cartoon-scene-actions .cartoon-scene-instruction { flex: 1; min-width: 180px; margin: 0; }
+
+.cartoon-phase-banner {
+  background: #241b3f;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 0.85rem;
+  color: var(--text);
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+.cartoon-scene-visual {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  background-size: cover;
+  background-position: center;
+  background-color: #000;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.cartoon-scene-visual-empty {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 0.8rem; background: var(--panel);
+}
+.cartoon-scene-avatars {
+  position: absolute; bottom: 8px; left: 8px;
+  display: flex; gap: 6px;
+}
+.cartoon-scene-avatar {
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  overflow: hidden;
+  background: var(--panel);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+}
+.cartoon-scene-avatar img { width: 100%; height: 100%; object-fit: cover; }
+
+.cartoon-spend-tracker {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+.cartoon-spend-tracker strong { color: var(--text); }
+
+.cartoon-episode-video-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  margin: 10px 0;
+  background: var(--panel);
+}
+.cartoon-episode-video {
+  width: 100%;
+  max-width: 320px;
+  display: block;
+  border-radius: 8px;
+  background: #000;
+  margin-bottom: 10px;
+}
+.cartoon-episode-video-controls, .cartoon-scene-video-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.cartoon-episode-video-controls select, .cartoon-scene-video-controls select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+  font-size: 0.78rem;
+}
+.cartoon-episode-video-status, .cartoon-scene-video-status {
+  margin-top: 6px;
+  min-height: 1em;
+}
+.cartoon-video-stale { color: #e0b84b; }
+
+.cartoon-scene-video-panel {
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 10px;
+}
+.cartoon-scene-video {
+  width: 100%;
+  max-width: 220px;
+  display: block;
+  border-radius: 8px;
+  background: #000;
+  margin-bottom: 8px;
+}

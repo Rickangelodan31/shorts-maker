@@ -1,76 +1,111 @@
 const os = require('os');
-const { run, FFMPEG_BIN, HAS_CAPTIONS } = require('./ffutil');
+const { run, FFMPEG_BIN, HAS_CAPTIONS, HAS_VIDEOTOOLBOX } = require('./ffutil');
+const {
+  OUT_W: DEFAULT_OUT_W, OUT_H: DEFAULT_OUT_H,
+  evenify, cropBoxFor, cropBoxForRegion,
+  FACE_CROP_MARGIN_STEPS, CONTENT_CROP_MARGIN, INSET_FACE_AR,
+} = require('./geometry');
 
-const OUT_W = 1080;
-const OUT_H = 1920;
 // When several clips render concurrently, cap each ffmpeg's thread count so they share
-// cores instead of each grabbing all of them and thrashing.
+// cores instead of each grabbing all of them and thrashing. (Only meaningful for the
+// software encoder — VideoToolbox doesn't expose a -threads knob at all.)
 const THREADS_PER_RENDER = Math.max(2, Math.floor(os.cpus().length / 3));
+const XFADE_DUR = 0.35;
+const USE_HW_ENCODE = HAS_VIDEOTOOLBOX && process.env.DISABLE_HW_ENCODE !== '1';
+const HW_BITRATE = process.env.RENDER_VIDEO_BITRATE || '8M';
 
-function evenify(n) {
-  return Math.max(2, Math.floor(n / 2) * 2);
-}
-
-// Computes a crop box (w,h,x,y) from the source that matches targetAR, centered on (cx,cy) (normalized 0..1).
-function cropBoxFor(srcW, srcH, cx, cy, targetAR) {
-  const srcAR = srcW / srcH;
-  let w, h;
-  if (srcAR > targetAR) {
-    h = srcH;
-    w = h * targetAR;
-  } else {
-    w = srcW;
-    h = w / targetAR;
-  }
-  w = evenify(w);
-  h = evenify(h);
-  let x = Math.round(cx * srcW - w / 2);
-  let y = Math.round(cy * srcH - h / 2);
-  x = Math.max(0, Math.min(srcW - w, x));
-  y = Math.max(0, Math.min(srcH - h, y));
-  return { w, h, x, y };
-}
-
-// Builds the filter_complex for one segment's layout (single crop, or 2-way split-screen),
-// operating on an already-trimmed/retimed stream label.
-function layoutFilter(vBase, layout, srcW, srcH) {
+// Builds the filter_complex for one segment's layout (single crop, split-screen, fit, or a
+// reaction/facecam-composite layout), operating on an already-trimmed/retimed stream label.
+// render.js is purely mechanical here — it never decides WHETHER a layout is valid or which
+// fallback to use, only how to turn an already-finalized layout object into filter syntax.
+// outW/outH: target output canvas — defaults to the app's standard 1080x1920 short, but a
+// job may request any size (see pipeline.js job.options.outputWidth/outputHeight). Must
+// match whatever effects.js used when it crop-validated this layout, or the crop that gets
+// built here could be one that was never actually checked.
+function layoutFilter(vBase, layout, srcW, srcH, outW = DEFAULT_OUT_W, outH = DEFAULT_OUT_H) {
   const parts = [];
   const vOut = `${vBase}out`;
   if (layout.type === 'split') {
-    const bandH = evenify(OUT_H / 2);
-    const targetAR = OUT_W / bandH;
+    const bandH = evenify(outH / 2);
+    const targetAR = outW / bandH;
     const [s1, s2] = layout.slots;
     const box1 = cropBoxFor(srcW, srcH, s1.cx, s1.cy, targetAR);
     const box2 = cropBoxFor(srcW, srcH, s2.cx, s2.cy, targetAR);
     parts.push(`[${vBase}]split=2[${vBase}x][${vBase}y]`);
-    parts.push(`[${vBase}x]crop=${box1.w}:${box1.h}:${box1.x}:${box1.y},scale=${OUT_W}:${bandH},setsar=1[${vBase}p1]`);
-    parts.push(`[${vBase}y]crop=${box2.w}:${box2.h}:${box2.x}:${box2.y},scale=${OUT_W}:${bandH},setsar=1[${vBase}p2]`);
+    parts.push(`[${vBase}x]crop=${box1.w}:${box1.h}:${box1.x}:${box1.y},scale=${outW}:${bandH},setsar=1[${vBase}p1]`);
+    parts.push(`[${vBase}y]crop=${box2.w}:${box2.h}:${box2.x}:${box2.y},scale=${outW}:${bandH},setsar=1[${vBase}p2]`);
     parts.push(`[${vBase}p1][${vBase}p2]vstack=inputs=2[${vOut}]`);
+  } else if (layout.type === 'reaction-split') {
+    // Two INDEPENDENTLY framed regions (the reacting face, and the content being reacted
+    // to) rather than two arbitrary point-centered slots — layout.faceBox/contentBox come
+    // from effects.js's facecam-vs-content separation, already crop-validated.
+    const bandH = evenify(outH / 2);
+    const targetAR = outW / bandH;
+    // Use exactly the margin effects.js validated against face landmarks (defaulting to
+    // the tightest step when no validation ran, e.g. no face ever detected) — a "cover"
+    // crop that fills the band, zoomed in enough that the reactor reads as prominent
+    // rather than small-with-lots-of-background.
+    const faceMargin = layout.faceMargin ?? FACE_CROP_MARGIN_STEPS[0];
+    const faceCrop = cropBoxForRegion(srcW, srcH, layout.faceBox, targetAR, faceMargin);
+    const contentCrop = cropBoxForRegion(srcW, srcH, layout.contentBox, targetAR, CONTENT_CROP_MARGIN);
+    parts.push(`[${vBase}]split=2[${vBase}x][${vBase}y]`);
+    parts.push(`[${vBase}x]crop=${faceCrop.w}:${faceCrop.h}:${faceCrop.x}:${faceCrop.y},scale=${outW}:${bandH},setsar=1[${vBase}p1]`);
+    parts.push(`[${vBase}y]crop=${contentCrop.w}:${contentCrop.h}:${contentCrop.x}:${contentCrop.y},scale=${outW}:${bandH},setsar=1[${vBase}p2]`);
+    parts.push(`[${vBase}p1][${vBase}p2]vstack=inputs=2[${vOut}]`);
+  } else if (layout.type === 'reaction-inset') {
+    // Content fills the frame; a small fixed-position (bottom-right) face inset overlays
+    // it — used when the facecam is small relative to the content. Plain rectangular PiP
+    // for v1; rounded corners/border are a deferred nice-to-have, not implemented here.
+    const contentCrop = cropBoxForRegion(srcW, srcH, layout.contentBox, outW / outH, CONTENT_CROP_MARGIN);
+    const faceMargin = layout.faceMargin ?? FACE_CROP_MARGIN_STEPS[0];
+    const faceCrop = cropBoxForRegion(srcW, srcH, layout.faceBox, INSET_FACE_AR, faceMargin);
+    const insetW = evenify(outW * 0.42);
+    const insetH = evenify(insetW / INSET_FACE_AR);
+    const marginPx = 40;
+    parts.push(`[${vBase}]split=2[${vBase}bg][${vBase}fg]`);
+    parts.push(`[${vBase}bg]crop=${contentCrop.w}:${contentCrop.h}:${contentCrop.x}:${contentCrop.y},scale=${outW}:${outH},setsar=1[${vBase}bgout]`);
+    parts.push(`[${vBase}fg]crop=${faceCrop.w}:${faceCrop.h}:${faceCrop.x}:${faceCrop.y},scale=${insetW}:${insetH},setsar=1[${vBase}fgout]`);
+    parts.push(`[${vBase}bgout][${vBase}fgout]overlay=W-w-${marginPx}:H-h-${marginPx}[${vOut}]`);
   } else if (layout.type === 'fit') {
     // Show the WHOLE frame (nobody cropped out) letterboxed over a blurred, zoomed-in copy
     // of the same frame as filler — used when a hard crop would have to cut someone off.
     parts.push(`[${vBase}]split=2[${vBase}bg][${vBase}fg]`);
     parts.push(
-      `[${vBase}bg]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,` +
-      `crop=${OUT_W}:${OUT_H},gblur=sigma=25[${vBase}bgblur]`
+      `[${vBase}bg]scale=${outW}:${outH}:force_original_aspect_ratio=increase,` +
+      `crop=${outW}:${outH},gblur=sigma=25[${vBase}bgblur]`
     );
-    parts.push(`[${vBase}fg]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease[${vBase}fgfit]`);
+    parts.push(`[${vBase}fg]scale=${outW}:${outH}:force_original_aspect_ratio=decrease[${vBase}fgfit]`);
     parts.push(`[${vBase}bgblur][${vBase}fgfit]overlay=(W-w)/2:(H-h)/2,setsar=1[${vOut}]`);
   } else {
-    const slot = layout.slot;
-    const box = cropBoxFor(srcW, srcH, slot.cx, slot.cy, OUT_W / OUT_H);
-    parts.push(`[${vBase}]crop=${box.w}:${box.h}:${box.x}:${box.y},scale=${OUT_W}:${OUT_H},setsar=1[${vOut}]`);
+    // Manually-edited segments (see effects.js:mapUserTypeToLayout) attach `manualCrop`, a
+    // sized region (so a zoom nudge has something to act on) — auto-generated 'single'
+    // layouts never set this and keep the original fixed-max-size crop unchanged.
+    const targetAR = outW / outH;
+    const box = layout.manualCrop
+      ? cropBoxForRegion(srcW, srcH, layout.manualCrop, targetAR, layout.manualCropMargin ?? 0.15)
+      : cropBoxFor(srcW, srcH, layout.slot.cx, layout.slot.cy, targetAR);
+    parts.push(`[${vBase}]crop=${box.w}:${box.h}:${box.x}:${box.y},scale=${outW}:${outH},setsar=1[${vOut}]`);
   }
   return { parts, vOut };
 }
 
-// segments: [{ start, end, rate, layout: {type:'single'|'split', ...} }] in the INPUT's local
-// time (after any -ss seek already applied by the caller).
-function buildSegmentedFilter(segments, srcW, srcH, captionsAssPath) {
-  const filterParts = [];
-  const pairLabels = [];
+// A segment is a candidate crossfade boundary only if it's part of the new dynamic-beat
+// machinery (a reaction/content-beat splice, or a reaction/facecam-composite layout) —
+// ordinary scene-change boundaries between single/split/fit keep today's hard cut, since
+// those weren't reported as a problem and a universal crossfade would add render cost and
+// touch working behavior for no requested benefit.
+function isCrossfadeCandidate(seg) {
+  return seg.tag === 'reaction' || seg.tag === 'content-beat'
+    || seg.layout.type === 'reaction-split' || seg.layout.type === 'reaction-inset';
+}
 
-  segments.forEach((seg, i) => {
+// segments: [{ start, end, rate, layout: {type:..., ...}, tag? }] in the INPUT's local
+// time (after any -ss seek already applied by the caller). NOT assumed to be chronological
+// — a hook cold-open may place a later-in-source segment first.
+function buildSegmentedFilter(segments, srcW, srcH, captionsAssPath, outW = DEFAULT_OUT_W, outH = DEFAULT_OUT_H) {
+  const filterParts = [];
+
+  const segOut = segments.map((seg, i) => {
     const rate = seg.rate || 1;
     const vBase = `v${i}b`;
     const aBase = `a${i}`;
@@ -83,21 +118,55 @@ function buildSegmentedFilter(segments, srcW, srcH, captionsAssPath) {
     aChain += `[${aBase}]`;
     filterParts.push(aChain);
 
-    const { parts, vOut } = layoutFilter(vBase, seg.layout, srcW, srcH);
+    const { parts, vOut } = layoutFilter(vBase, seg.layout, srcW, srcH, outW, outH);
     filterParts.push(...parts);
-    pairLabels.push({ v: `[${vOut}]`, a: `[${aBase}]` });
+    const outLen = (seg.end - seg.start) / rate;
+    return { v: `[${vOut}]`, a: `[${aBase}]`, outLen, rate, crossfadeCandidate: isCrossfadeCandidate(seg) };
   });
 
   let vLabel;
   let aLabel;
-  if (segments.length === 1) {
-    vLabel = pairLabels[0].v;
-    aLabel = pairLabels[0].a;
+  if (segOut.length === 1) {
+    vLabel = segOut[0].v;
+    aLabel = segOut[0].a;
   } else {
-    const concatInputs = pairLabels.map((l) => `${l.v}${l.a}`).join('');
-    filterParts.push(`${concatInputs}concat=n=${segments.length}:v=1:a=1[vcat][acat]`);
-    vLabel = '[vcat]';
-    aLabel = '[acat]';
+    let curV = segOut[0].v;
+    let curA = segOut[0].a;
+    let cumulativeLen = segOut[0].outLen;
+    for (let i = 1; i < segOut.length; i++) {
+      const prev = segOut[i - 1];
+      const next = segOut[i];
+      const outV = `xc${i}v`;
+      const outA = `xc${i}a`;
+      const canCrossfade = (prev.crossfadeCandidate || next.crossfadeCandidate)
+        && prev.rate === 1 && next.rate === 1
+        && cumulativeLen > XFADE_DUR && next.outLen > XFADE_DUR;
+
+      if (canCrossfade) {
+        const offset = (cumulativeLen - XFADE_DUR).toFixed(3);
+        // xfade requires BOTH inputs to share a timebase, but a plain source trim, a prior
+        // concat's output, and a prior xfade's output can each carry a different internal
+        // timebase — chaining them straight into xfade intermittently fails with
+        // "timebase do not match" once the graph mixes concat and xfade nodes. Forcing a
+        // fixed, explicit timebase on both inputs right before every xfade call makes the
+        // result independent of whatever produced them upstream.
+        const tbA = `${outV}tba`;
+        const tbB = `${outV}tbb`;
+        filterParts.push(`${curV}settb=1/1000000[${tbA}]`);
+        filterParts.push(`${next.v}settb=1/1000000[${tbB}]`);
+        filterParts.push(`[${tbA}][${tbB}]xfade=transition=fade:duration=${XFADE_DUR}:offset=${offset}[${outV}]`);
+        filterParts.push(`${curA}${next.a}acrossfade=d=${XFADE_DUR}[${outA}]`);
+        cumulativeLen = cumulativeLen + next.outLen - XFADE_DUR;
+      } else {
+        filterParts.push(`${curV}${next.v}concat=n=2:v=1:a=0[${outV}]`);
+        filterParts.push(`${curA}${next.a}concat=n=2:v=0:a=1[${outA}]`);
+        cumulativeLen += next.outLen;
+      }
+      curV = `[${outV}]`;
+      curA = `[${outA}]`;
+    }
+    vLabel = curV;
+    aLabel = curA;
   }
 
   if (captionsAssPath && HAS_CAPTIONS) {
@@ -109,23 +178,40 @@ function buildSegmentedFilter(segments, srcW, srcH, captionsAssPath) {
   return { filter: filterParts.join(';'), vLabel, aLabel };
 }
 
-// seek: optional -ss applied before -i (fast input seek into a large local source file).
-// Use 0 when inputPath is already a pre-trimmed small clip (e.g. from a URL section download).
-async function renderSegmented({ inputPath, seek = 0, srcW, srcH, segments, captionsAssPath, outputPath }) {
-  const { filter, vLabel, aLabel } = buildSegmentedFilter(segments, srcW, srcH, captionsAssPath);
-  const args = ['-y'];
-  if (seek > 0) args.push('-ss', String(seek));
-  args.push('-i', inputPath);
-  args.push(
-    '-filter_complex', filter,
-    '-map', vLabel,
-    '-map', aLabel,
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-threads', String(THREADS_PER_RENDER),
-    '-c:a', 'aac', '-b:a', '160k',
-    '-movflags', '+faststart',
-    outputPath
-  );
-  await run(FFMPEG_BIN, args);
+function doubledBitrate(bitrateStr) {
+  const m = String(bitrateStr).match(/^(\d+(?:\.\d+)?)([kKmM]?)$/);
+  return m ? `${parseFloat(m[1]) * 2}${m[2]}` : bitrateStr;
+}
+const HW_BUFSIZE = doubledBitrate(HW_BITRATE);
+
+function videoCodecArgs(hw) {
+  return hw
+    ? ['-c:v', 'h264_videotoolbox', '-b:v', HW_BITRATE, '-maxrate', HW_BITRATE, '-bufsize', HW_BUFSIZE, '-allow_sw', '1']
+    : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-threads', String(THREADS_PER_RENDER)];
 }
 
-module.exports = { renderSegmented, buildSegmentedFilter, cropBoxFor, OUT_W, OUT_H };
+// seek: optional -ss applied before -i (fast input seek into a large local source file).
+// Use 0 when inputPath is already a pre-trimmed small clip (e.g. from a URL section download).
+// outW/outH: final output canvas size (default 1080x1920) — see pipeline.js job.options.
+async function renderSegmented({ inputPath, seek = 0, srcW, srcH, segments, captionsAssPath, outputPath, outW = DEFAULT_OUT_W, outH = DEFAULT_OUT_H }) {
+  const { filter, vLabel, aLabel } = buildSegmentedFilter(segments, srcW, srcH, captionsAssPath, outW, outH);
+  const baseArgs = ['-y'];
+  if (seek > 0) baseArgs.push('-ss', String(seek));
+  baseArgs.push('-i', inputPath, '-filter_complex', filter, '-map', vLabel, '-map', aLabel);
+  const tailArgs = ['-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', outputPath];
+
+  if (USE_HW_ENCODE) {
+    try {
+      await run(FFMPEG_BIN, [...baseArgs, ...videoCodecArgs(true), ...tailArgs]);
+      return;
+    } catch (err) {
+      // VideoToolbox can be listed as available yet still fail at runtime in some
+      // environments (headless CI, a sandboxed/remote session with no GPU access) — fall
+      // back to the software encoder rather than let the whole render fail.
+      console.warn('[render] hardware encode failed, falling back to software libx264:', err.message);
+    }
+  }
+  await run(FFMPEG_BIN, [...baseArgs, ...videoCodecArgs(false), ...tailArgs]);
+}
+
+module.exports = { renderSegmented, buildSegmentedFilter, layoutFilter, OUT_W: DEFAULT_OUT_W, OUT_H: DEFAULT_OUT_H };

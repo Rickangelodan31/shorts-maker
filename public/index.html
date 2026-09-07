@@ -14,9 +14,13 @@
     </div>
     <h1>Shorts Maker</h1>
     <p class="tagline">Turn one long video into up to 10 vertical shorts &mdash; AI picks the highlight moments and how long each one should be.</p>
+    <div class="app-tabs">
+      <button class="app-tab active" data-app-tab="shorts">Shorts Maker</button>
+      <button class="app-tab" data-app-tab="cartoon">AI Cartoon &amp; Story Studio</button>
+    </div>
   </header>
 
-  <main>
+  <main id="app-shorts" class="app-panel">
     <section class="card" id="accounts-card">
       <h2>Connected accounts</h2>
       <p class="hint">Connect a platform to post finished clips straight from here.</p>
@@ -61,6 +65,26 @@
         </div>
       </div>
 
+      <div class="options-row">
+        <div class="option">
+          <label for="aspect-preset">Output size</label>
+          <select id="aspect-preset">
+            <option value="1080x1920" selected>Vertical 9:16 (1080&times;1920)</option>
+            <option value="1080x1080">Square 1:1 (1080&times;1080)</option>
+            <option value="1920x1080">Landscape 16:9 (1920&times;1080)</option>
+            <option value="custom">Custom&hellip;</option>
+          </select>
+        </div>
+        <div class="option dimension-inputs hidden" id="dimension-inputs">
+          <label for="output-width">Width &times; height (px)</label>
+          <div class="dimension-row">
+            <input id="output-width" type="number" min="200" max="1920" step="2" value="1080" />
+            <span>&times;</span>
+            <input id="output-height" type="number" min="200" max="1920" step="2" value="1920" />
+          </div>
+        </div>
+      </div>
+
       <button id="generate-btn">Generate Shorts</button>
     </section>
 
@@ -81,6 +105,106 @@
     </section>
   </main>
 
+  <main id="app-cartoon" class="app-panel hidden">
+    <section class="card" id="cartoon-projects-card">
+      <h2>Your Projects</h2>
+      <p class="hint">Each project keeps its own Character Library, Location Library, Story Bible, and episodes &mdash; the same characters, voices-to-be, and world carry across every episode in a project.</p>
+      <div id="cartoon-projects-grid" class="cartoon-projects-grid"></div>
+      <div class="cartoon-new-project-row">
+        <input id="cartoon-new-project-name" type="text" placeholder="New project name (e.g. Max &amp; Friends)" />
+        <button id="cartoon-new-project-btn">Create Project</button>
+      </div>
+    </section>
+
+    <section class="card hidden" id="cartoon-workspace-card">
+      <div class="cartoon-workspace-header">
+        <h2 id="cartoon-project-title">Project</h2>
+        <button id="cartoon-back-btn" class="link-btn">&larr; All projects</button>
+      </div>
+
+      <div class="cartoon-tabs">
+        <button class="cartoon-tab active" data-cartoon-tab="create">Create Story / Rhyme</button>
+        <button class="cartoon-tab" data-cartoon-tab="characters">Character Library</button>
+        <button class="cartoon-tab" data-cartoon-tab="locations">Location Library</button>
+        <button class="cartoon-tab" data-cartoon-tab="bible">Story Bible</button>
+        <button class="cartoon-tab" data-cartoon-tab="episodes">Episodes</button>
+        <button class="cartoon-tab" data-cartoon-tab="settings">Project Settings</button>
+      </div>
+
+      <div class="cartoon-tab-panel" data-cartoon-panel="create">
+        <div class="cartoon-mode-row">
+          <button class="cartoon-mode-btn active" data-mode="story">Create Story</button>
+          <button class="cartoon-mode-btn" data-mode="nursery">Create Nursery Rhyme</button>
+          <button class="cartoon-mode-btn" data-mode="userstory">Use My Own Storyline</button>
+        </div>
+        <label for="cartoon-idea-input" id="cartoon-idea-label">Story idea</label>
+        <textarea id="cartoon-idea-input" rows="5" placeholder="e.g. A puppy gets lost on his first day at school."></textarea>
+        <div class="options-row hidden" id="cartoon-length-row">
+          <div class="option">
+            <label for="cartoon-length">Length</label>
+            <select id="cartoon-length">
+              <option value="random" selected>Random (AI picks)</option>
+              <option value="30s">30 seconds</option>
+              <option value="1m">1 minute</option>
+              <option value="2m">2 minutes</option>
+              <option value="3m">3 minutes</option>
+              <option value="5m">5 minutes</option>
+              <option value="custom">Custom&hellip;</option>
+            </select>
+          </div>
+          <div class="option hidden" id="cartoon-length-custom-wrap">
+            <label for="cartoon-length-custom">Custom length (seconds)</label>
+            <input id="cartoon-length-custom" type="number" min="5" max="1200" value="60" />
+          </div>
+        </div>
+        <button id="cartoon-generate-btn">Generate</button>
+        <div class="cartoon-generating hidden" id="cartoon-generating"><div class="mini-spinner"></div><span>Writing your story&hellip; this can take a bit.</span></div>
+      </div>
+
+      <div class="cartoon-tab-panel hidden" data-cartoon-panel="characters">
+        <div class="cartoon-library-toolbar">
+          <input id="cartoon-new-character-instruction" type="text" placeholder="Describe a character to create (or leave blank for a surprise)" />
+          <button id="cartoon-new-character-btn">Create Character</button>
+        </div>
+        <div id="cartoon-characters-grid" class="cartoon-library-grid"></div>
+      </div>
+
+      <div class="cartoon-tab-panel hidden" data-cartoon-panel="locations">
+        <div class="cartoon-library-toolbar">
+          <input id="cartoon-new-location-instruction" type="text" placeholder="Describe a location to create (or leave blank for a surprise)" />
+          <button id="cartoon-new-location-btn">Create Location</button>
+        </div>
+        <div id="cartoon-locations-grid" class="cartoon-library-grid"></div>
+      </div>
+
+      <div class="cartoon-tab-panel hidden" data-cartoon-panel="bible">
+        <div id="cartoon-bible-view"></div>
+      </div>
+
+      <div class="cartoon-tab-panel hidden" data-cartoon-panel="episodes">
+        <div id="cartoon-episodes-list"></div>
+      </div>
+
+      <div class="cartoon-tab-panel hidden" data-cartoon-panel="settings">
+        <div class="option">
+          <label for="cartoon-style-preset">Visual style</label>
+          <select id="cartoon-style-preset"></select>
+        </div>
+        <div class="option">
+          <label for="cartoon-style-custom">Custom style direction (optional)</label>
+          <textarea id="cartoon-style-custom" rows="2"></textarea>
+        </div>
+        <div class="option checkbox-option">
+          <label><input id="cartoon-style-locked" type="checkbox" /> Lock Style</label>
+        </div>
+        <button id="cartoon-save-settings-btn">Save Project Settings</button>
+      </div>
+    </section>
+
+    <section class="card hidden" id="cartoon-error-card"><p id="cartoon-error-message"></p></section>
+  </main>
+
   <script src="/app.js"></script>
+  <script src="/cartoon.js"></script>
 </body>
 </html>

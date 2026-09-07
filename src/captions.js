@@ -66,14 +66,17 @@ function fitFontSize(text, baseFontSize, maxWidthPx, minFontSize = 30) {
   return fs;
 }
 
-// Maps a clip-local time (pre-effect) to output time, accounting for slow-mo segments so
-// captions stay in sync even when part of the clip is retimed.
+// Maps a clip-local time (pre-effect) to output time, accounting for slow-mo segments AND
+// reordered segments (e.g. a hook cold-open spliced to the front) so captions stay in sync.
+// Segments are NOT assumed to be chronologically sorted — a word's time must fall inside
+// the segment's own [start,end], not just "at or before some segment's end", or a hook
+// segment moved to the front would wrongly claim every early word for itself.
 function remapTime(t, segments) {
   let acc = 0;
   for (const seg of segments) {
     const rate = seg.rate || 1;
     const outLen = (seg.end - seg.start) / rate;
-    if (t <= seg.end) {
+    if (t >= seg.start && t <= seg.end) {
       const within = Math.max(0, t - seg.start);
       return acc + within / rate;
     }

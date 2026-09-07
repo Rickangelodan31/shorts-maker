@@ -23,6 +23,23 @@ const errorMessage = document.getElementById('error-message');
 let moreInFlight = false;
 let connectedPlatforms = {};
 
+// --- Output size preset ---
+const aspectPreset = document.getElementById('aspect-preset');
+const dimensionInputs = document.getElementById('dimension-inputs');
+const outputWidthInput = document.getElementById('output-width');
+const outputHeightInput = document.getElementById('output-height');
+
+aspectPreset.addEventListener('change', () => {
+  if (aspectPreset.value === 'custom') {
+    dimensionInputs.classList.remove('hidden');
+    return;
+  }
+  dimensionInputs.classList.add('hidden');
+  const [w, h] = aspectPreset.value.split('x');
+  outputWidthInput.value = w;
+  outputHeightInput.value = h;
+});
+
 const PLATFORM_LABELS = { youtube: 'YouTube', tiktok: 'TikTok', instagram: 'Instagram' };
 
 async function loadAccount() {
@@ -95,6 +112,8 @@ const STATUS_LABELS = {
 function effectBadge(effect) {
   if (effect === 'slowmo') return '<span class="badge slowmo">dramatic slow-mo</span>';
   if (effect === 'reaction') return '<span class="badge reaction">reaction cut</span>';
+  if (effect === 'content-beat') return '<span class="badge reaction">content beat</span>';
+  if (effect === 'hook') return '<span class="badge reaction">cold-open hook</span>';
   return '';
 }
 
@@ -123,7 +142,9 @@ async function postToSocial(clipUrl, platform, btn, select) {
   }
 }
 
-function renderCard(entry) {
+const TYPE_LABELS = { full: 'Full screen', split: 'Split screen', reactor: 'Reactor only', content: 'Content only' };
+
+function renderCard(entry, jobId) {
   if (entry.status === 'done') {
     const div = document.createElement('div');
     div.className = 'result-item';
@@ -138,14 +159,22 @@ function renderCard(entry) {
       <video src="${entry.url}" controls playsinline muted></video>
       <div class="label">${labelForLength(entry.length)} ${effectBadge(entry.effect)}</div>
       <div class="meta">from ${entry.start}s &middot; ${peopleNote(entry.faceCount, entry.layoutSwitches)}</div>
-      <a href="${entry.url}" download>Download</a>
+      <div class="actions-row">
+        <a href="${entry.url}" download>Download</a>
+        <button class="edit-layout-btn">Edit layout</button>
+      </div>
       ${postControls}
+      <div class="editor-panel hidden"></div>
     `;
     if (connectedNames.length) {
       const select = div.querySelector('.post-platform');
       const btn = div.querySelector('.post-btn');
       btn.addEventListener('click', () => postToSocial(entry.url, select.value, btn, select));
     }
+    const editBtn = div.querySelector('.edit-layout-btn');
+    const panel = div.querySelector('.editor-panel');
+    const video = div.querySelector('video');
+    editBtn.addEventListener('click', () => toggleEditor(jobId, entry, panel, video, editBtn));
     return div;
   }
   if (entry.status === 'error') {
@@ -181,7 +210,7 @@ function renderResults(job) {
 
   const sorted = [...job.results].sort((a, b) => a.candidateIndex - b.candidateIndex);
   for (const entry of sorted) {
-    resultsGrid.appendChild(renderCard(entry));
+    resultsGrid.appendChild(renderCard(entry, job.id));
   }
 
   const totalCandidates = job.candidates?.length;
@@ -255,6 +284,8 @@ async function startJob() {
   const captionTheme = document.getElementById('caption-theme').value;
   const emojis = document.getElementById('emoji-toggle').checked;
   const tightenPacing = document.getElementById('pacing-toggle').checked;
+  const outputWidth = document.getElementById('output-width').value;
+  const outputHeight = document.getElementById('output-height').value;
 
   try {
     let jobId;
@@ -264,7 +295,7 @@ async function startJob() {
       const res = await fetch('/api/jobs/url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, captionTheme, emojis, tightenPacing }),
+        body: JSON.stringify({ url, captionTheme, emojis, tightenPacing, outputWidth, outputHeight }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to start job');
@@ -277,6 +308,8 @@ async function startJob() {
       form.append('captionTheme', captionTheme);
       form.append('emojis', String(emojis));
       form.append('tightenPacing', String(tightenPacing));
+      form.append('outputWidth', outputWidth);
+      form.append('outputHeight', outputHeight);
       const res = await fetch('/api/jobs/upload', { method: 'POST', body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to start job');
@@ -292,3 +325,227 @@ async function startJob() {
 }
 
 generateBtn.addEventListener('click', startJob);
+
+// --- Manual layout editor ---
+
+async function toggleEditor(jobId, entry, panel, video, editBtn) {
+  if (!panel.classList.contains('hidden')) {
+    panel.classList.add('hidden');
+    panel.innerHTML = '';
+    editBtn.textContent = 'Edit layout';
+    return;
+  }
+  editBtn.textContent = 'Close editor';
+  panel.classList.remove('hidden');
+  panel.innerHTML = '<p class="hint">Loading timeline...</p>';
+  try {
+    const res = await fetch(`/api/jobs/${jobId}/clips/${entry.candidateIndex}/timeline`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to load timeline');
+    const state = {
+      jobId, index: entry.candidateIndex, clipLength: data.clipLength,
+      segments: data.segments.map((s) => ({ ...s })), userTypeOptions: data.userTypeOptions,
+      selectedIdx: null,
+    };
+    buildEditorUI(state, panel, video, editBtn);
+  } catch (err) {
+    panel.innerHTML = `<p class="hint">Failed to load editor: ${err.message}</p>`;
+  }
+}
+
+function adjust(seg, key, fn) {
+  if (key) {
+    seg.cropAdjust = seg.cropAdjust || {};
+    seg.cropAdjust[key] = seg.cropAdjust[key] || { dcx: 0, dcy: 0, dzoom: 1 };
+    fn(seg.cropAdjust[key]);
+  } else {
+    seg.cropAdjust = seg.cropAdjust || { dcx: 0, dcy: 0, dzoom: 1 };
+    fn(seg.cropAdjust);
+  }
+}
+
+function buildNudgePad(seg, key, label, onChange) {
+  const wrap = document.createElement('div');
+  wrap.className = 'nudge-group';
+  const title = document.createElement('div');
+  title.className = 'nudge-label';
+  title.textContent = label;
+  wrap.appendChild(title);
+  const pad = document.createElement('div');
+  pad.className = 'nudge-pad';
+  const STEP = 0.03;
+  const dirs = [
+    ['←', () => adjust(seg, key, (a) => { a.dcx -= STEP; })],
+    ['→', () => adjust(seg, key, (a) => { a.dcx += STEP; })],
+    ['↑', () => adjust(seg, key, (a) => { a.dcy -= STEP; })],
+    ['↓', () => adjust(seg, key, (a) => { a.dcy += STEP; })],
+    ['zoom +', () => adjust(seg, key, (a) => { a.dzoom *= 0.9; })],
+    ['zoom −', () => adjust(seg, key, (a) => { a.dzoom *= 1.1; })],
+  ];
+  dirs.forEach(([symbol, fn]) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'nudge-btn';
+    b.textContent = symbol;
+    b.addEventListener('click', () => { fn(); onChange(); });
+    pad.appendChild(b);
+  });
+  wrap.appendChild(pad);
+  return wrap;
+}
+
+function buildEditorUI(state, panel, video, editBtn) {
+  panel.innerHTML = `
+    <div class="timeline-bar"></div>
+    <div class="editor-controls"><button type="button" class="split-here-btn">Split at current time</button></div>
+    <div class="inspector"></div>
+    <div class="editor-actions">
+      <button type="button" class="editor-cancel-btn">Cancel</button>
+      <button type="button" class="editor-save-btn">Save &amp; re-render</button>
+    </div>
+  `;
+  const bar = panel.querySelector('.timeline-bar');
+  const inspector = panel.querySelector('.inspector');
+
+  function refresh() {
+    renderTimelineBar();
+    renderInspector();
+  }
+
+  function renderTimelineBar() {
+    bar.innerHTML = '';
+    state.segments.forEach((seg, i) => {
+      const block = document.createElement('div');
+      block.className = `timeline-block type-${seg.userType}${i === state.selectedIdx ? ' selected' : ''}`;
+      block.style.left = `${(seg.start / state.clipLength) * 100}%`;
+      block.style.width = `${Math.max(0.5, ((seg.end - seg.start) / state.clipLength) * 100)}%`;
+      block.title = `${TYPE_LABELS[seg.userType]} (${seg.start.toFixed(1)}s–${seg.end.toFixed(1)}s)`;
+      block.addEventListener('click', () => { state.selectedIdx = i; refresh(); });
+      bar.appendChild(block);
+
+      if (i < state.segments.length - 1) {
+        const handle = document.createElement('div');
+        handle.className = 'timeline-handle';
+        handle.style.left = `${(seg.end / state.clipLength) * 100}%`;
+        handle.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const barRect = bar.getBoundingClientRect();
+          const onMove = (moveEvent) => {
+            const x = moveEvent.clientX - barRect.left;
+            let t = (x / barRect.width) * state.clipLength;
+            const minLen = 0.3;
+            t = Math.max(state.segments[i].start + minLen, Math.min(state.segments[i + 1].end - minLen, t));
+            state.segments[i].end = t;
+            state.segments[i + 1].start = t;
+            renderTimelineBar();
+          };
+          const onUp = () => {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+          };
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        });
+        bar.appendChild(handle);
+      }
+    });
+  }
+
+  function renderInspector() {
+    inspector.innerHTML = '';
+    if (state.selectedIdx == null || !state.segments[state.selectedIdx]) {
+      inspector.innerHTML = '<p class="hint">Click a segment on the timeline to edit it.</p>';
+      return;
+    }
+    const seg = state.segments[state.selectedIdx];
+
+    const header = document.createElement('div');
+    header.className = 'inspector-header';
+    header.innerHTML = `<span>${seg.start.toFixed(1)}s – ${seg.end.toFixed(1)}s</span>`;
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'delete-segment-btn';
+    delBtn.textContent = 'Delete';
+    delBtn.disabled = state.segments.length <= 1;
+    delBtn.addEventListener('click', () => {
+      const i = state.selectedIdx;
+      if (state.segments.length <= 1) return;
+      if (i === 0) {
+        state.segments[1].start = state.segments[0].start;
+        state.segments.splice(0, 1);
+      } else {
+        state.segments[i - 1].end = state.segments[i].end;
+        state.segments.splice(i, 1);
+      }
+      state.selectedIdx = null;
+      refresh();
+    });
+    header.appendChild(delBtn);
+    inspector.appendChild(header);
+
+    const typeRow = document.createElement('div');
+    typeRow.className = 'type-switcher';
+    for (const t of ['full', 'split', 'reactor', 'content']) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = TYPE_LABELS[t];
+      btn.className = 'type-btn' + (seg.userType === t ? ' active' : '');
+      btn.disabled = !state.userTypeOptions.includes(t);
+      btn.addEventListener('click', () => { seg.userType = t; seg.cropAdjust = null; refresh(); });
+      typeRow.appendChild(btn);
+    }
+    inspector.appendChild(typeRow);
+
+    if (seg.userType !== 'full') {
+      let groups = [[null, 'Position / zoom']];
+      if (seg.userType === 'split') {
+        groups = state.userTypeOptions.includes('content')
+          ? [['face', 'Reactor position'], ['content', 'Content position']]
+          : []; // ordinary 2-person split isn't crop-adjustable yet
+      }
+      groups.forEach(([key, label]) => inspector.appendChild(buildNudgePad(seg, key, label, refresh)));
+    }
+  }
+
+  refresh();
+
+  panel.querySelector('.split-here-btn').addEventListener('click', () => {
+    const t = video.currentTime;
+    const idx = state.segments.findIndex((s) => t > s.start + 0.15 && t < s.end - 0.15);
+    if (idx === -1) return;
+    const seg = state.segments[idx];
+    const clone = { ...seg, cropAdjust: seg.cropAdjust ? JSON.parse(JSON.stringify(seg.cropAdjust)) : null };
+    seg.end = t;
+    clone.start = t;
+    state.segments.splice(idx + 1, 0, clone);
+    state.selectedIdx = idx + 1;
+    refresh();
+  });
+
+  panel.querySelector('.editor-cancel-btn').addEventListener('click', () => {
+    panel.classList.add('hidden');
+    panel.innerHTML = '';
+    editBtn.textContent = 'Edit layout';
+  });
+
+  panel.querySelector('.editor-save-btn').addEventListener('click', async () => {
+    const btn = panel.querySelector('.editor-save-btn');
+    btn.disabled = true;
+    btn.textContent = 'Re-rendering...';
+    try {
+      const res = await fetch(`/api/jobs/${state.jobId}/clips/${state.index}/timeline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ segments: state.segments }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Save failed');
+      pollJob(state.jobId, { immediate: true });
+    } catch (err) {
+      alert('Failed to save: ' + err.message);
+      btn.disabled = false;
+      btn.textContent = 'Save & re-render';
+    }
+  });
+}

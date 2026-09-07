@@ -1,16 +1,28 @@
 require('dotenv').config();
+// Additive: `vercel env pull .env.local` (the Cartoon Studio's AI Gateway setup step) writes
+// here. Loaded after .env so nothing in .env is overridden — the two files hold disjoint
+// vars in practice (video-clipper secrets vs VERCEL_OIDC_TOKEN).
+require('dotenv').config({ path: '.env.local' });
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
 const multer = require('multer');
-const { runPipeline, renderMore, OUTPUT_DIR } = require('./src/pipeline');
+const { runPipeline, renderMore, applyManualEdit, OUTPUT_DIR } = require('./src/pipeline');
+const { computeUserTypeOptions, inferUserTypeFromLayout } = require('./src/effects');
 const { UPLOAD_DIR } = require('./src/ingest');
 const auth = require('./src/auth');
 const youtube = require('./src/social/youtube');
 const tiktok = require('./src/social/tiktok');
 const instagram = require('./src/social/instagram');
+const cartoonStore = require('./src/cartoon/store');
+const cartoonCharacters = require('./src/cartoon/characters');
+const cartoonLocations = require('./src/cartoon/locations');
+const cartoonStory = require('./src/cartoon/story');
+const cartoonStyle = require('./src/cartoon/style');
+const cartoonVideo = require('./src/cartoon/video');
+const cartoonAi = require('./src/cartoon/ai');
 
 const PLATFORMS = { youtube, tiktok, instagram };
 
@@ -161,11 +173,25 @@ function newJobId() {
   return crypto.randomBytes(8).toString('hex');
 }
 
+// Bounded so a mistyped/malicious value can't blow up render time or memory (an earlier,
+// hard-learned lesson: this app runs fine on machines with limited RAM, and every extra
+// output pixel costs real encode time/memory per clip).
+const MIN_OUTPUT_DIM = 200;
+const MAX_OUTPUT_DIM = 1920;
+
+function parseDimension(value, fallback) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n) || n < MIN_OUTPUT_DIM || n > MAX_OUTPUT_DIM) return fallback;
+  return n % 2 === 0 ? n : n - 1; // h264 requires even dimensions
+}
+
 function parseOptions(body) {
   const theme = ['none', 'bold', 'clean', 'meme'].includes(body.captionTheme) ? body.captionTheme : 'none';
   const emojis = body.emojis === 'false' || body.emojis === false ? false : true;
   const tightenPacing = body.tightenPacing === 'true' || body.tightenPacing === true;
-  return { captionTheme: theme, emojis, tightenPacing };
+  const outputWidth = parseDimension(body.outputWidth, 1080);
+  const outputHeight = parseDimension(body.outputHeight, 1920);
+  return { captionTheme: theme, emojis, tightenPacing, outputWidth, outputHeight };
 }
 
 app.post('/api/jobs/upload', (req, res, next) => {
@@ -206,6 +232,334 @@ app.post('/api/jobs/:id/more', (req, res) => {
     job.results.push({ candidateIndex: -1, status: 'error', message: err.message });
   });
   res.json({ ok: true });
+});
+
+const USER_TYPES = ['full', 'split', 'reactor', 'content'];
+
+function validateEditedSegments(segments, clipLength) {
+  if (!Array.isArray(segments) || !segments.length) return 'segments must be a non-empty array';
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    if (typeof s.start !== 'number' || typeof s.end !== 'number' || !Number.isFinite(s.start) || !Number.isFinite(s.end)) {
+      return `segment ${i} has an invalid start/end`;
+    }
+    if (s.end - s.start < 0.3) return `segment ${i} is shorter than the 0.3s minimum`;
+    if (!USER_TYPES.includes(s.userType)) return `segment ${i} has an invalid layout type`;
+    if (i > 0 && Math.abs(s.start - segments[i - 1].end) > 0.05) return `segment ${i} is not contiguous with the previous one`;
+  }
+  if (segments[0].start < -0.05) return 'segments must start at 0';
+  if (typeof clipLength === 'number' && Math.abs(segments[segments.length - 1].end - clipLength) > 0.5) {
+    return 'segments must cover the full clip duration';
+  }
+  return null;
+}
+
+app.get('/api/jobs/:id/clips/:index/timeline', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  const index = parseInt(req.params.index, 10);
+  const entry = job.results?.find((r) => r.candidateIndex === index);
+  const cand = job.candidates?.[index];
+  if (!entry || !cand || entry.status !== 'done') return res.status(404).json({ error: 'Clip not found or not ready' });
+  const segments = (entry.segments || []).map((s) => ({ start: s.start, end: s.end, userType: inferUserTypeFromLayout(s) }));
+  const userTypeOptions = computeUserTypeOptions(cand.layoutTimeline, cand.resolvedReactionComposite);
+  res.json({ segments, userTypeOptions, clipLength: entry.length });
+});
+
+app.post('/api/jobs/:id/clips/:index/timeline', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  const index = parseInt(req.params.index, 10);
+  const entry = job.results?.find((r) => r.candidateIndex === index);
+  if (!entry || entry.status !== 'done') return res.status(400).json({ error: 'Clip is not ready to edit' });
+
+  const { segments } = req.body || {};
+  const error = validateEditedSegments(segments, entry.length);
+  if (error) return res.status(400).json({ error });
+
+  applyManualEdit(job, index, segments).catch(() => {}); // entry.status/message already set on failure
+  res.json({ ok: true });
+});
+
+// --- AI Cartoon & Story Studio (Phase 1: story/character/location system) ---
+// Separate subsystem (src/cartoon/*) — persisted in MongoDB, images in Vercel Blob, AI via
+// the Gateway adapter in src/cartoon/ai.js. Does not touch the video-clipper code above.
+const cartoonImageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+// Video generation jobs (Phase 2) — same ephemeral in-memory-Map + polling pattern as the
+// video-clipper's `jobs` above. Only progress tracking lives here; the real result
+// (scene/episode videoUrl, spend log) is persisted to MongoDB via cartoonStore.withProject,
+// so a finished video survives a server restart even though an in-flight job doesn't.
+const cartoonVideoJobs = new Map();
+
+// Async route handlers don't auto-forward rejections to Express error handling — wrap them
+// so a thrown Error (e.g. "Project not found", "AI Gateway not configured") becomes a clean
+// JSON error response instead of an unhandled rejection.
+function ah(fn) {
+  return (req, res) => fn(req, res).catch((err) => {
+    console.error('[cartoon] request failed:', err.message);
+    res.status(400).json({ error: err.message });
+  });
+}
+
+app.get('/api/cartoon/styles', (req, res) => res.json({ presets: cartoonStyle.listPresets() }));
+
+app.post('/api/cartoon/projects', ah(async (req, res) => {
+  const project = await cartoonStore.createProject(req.session.userId, req.body?.name);
+  res.json(project);
+}));
+
+app.get('/api/cartoon/projects', ah(async (req, res) => {
+  const projects = await cartoonStore.listProjects(req.session.userId);
+  res.json(projects);
+}));
+
+app.get('/api/cartoon/projects/:id', ah(async (req, res) => {
+  const project = await cartoonStore.getProject(req.session.userId, req.params.id);
+  res.json(project);
+}));
+
+app.patch('/api/cartoon/projects/:id', ah(async (req, res) => {
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    if (typeof req.body.name === 'string') p.name = req.body.name;
+    if (req.body.style) p.style = { ...p.style, ...req.body.style };
+    if (req.body.storyBible) p.storyBible = { ...p.storyBible, ...req.body.storyBible };
+  });
+  res.json(project);
+}));
+
+app.delete('/api/cartoon/projects/:id', ah(async (req, res) => {
+  await cartoonStore.deleteProject(req.session.userId, req.params.id);
+  res.json({ ok: true });
+}));
+
+// --- Characters ---
+app.post('/api/cartoon/projects/:id/characters', ah(async (req, res) => {
+  let created;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    created = req.body?.instruction
+      ? await cartoonCharacters.generateCharacter(p, req.body.instruction)
+      : cartoonCharacters.addCharacter(p, req.body || {});
+  });
+  res.json({ project, character: created });
+}));
+
+app.patch('/api/cartoon/projects/:id/characters/:charId', ah(async (req, res) => {
+  let updated;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    updated = cartoonCharacters.updateCharacter(p, req.params.charId, req.body || {});
+  });
+  res.json({ project, character: updated });
+}));
+
+app.delete('/api/cartoon/projects/:id/characters/:charId', ah(async (req, res) => {
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    cartoonCharacters.removeCharacter(p, req.params.charId);
+  });
+  res.json({ project });
+}));
+
+app.post('/api/cartoon/projects/:id/characters/:charId/image', cartoonImageUpload.single('file'), ah(async (req, res) => {
+  let updated;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    if (req.file) {
+      updated = await cartoonCharacters.setCharacterImageFromUpload(p, req.params.charId, req.file.buffer, req.file.mimetype);
+    } else {
+      updated = await cartoonCharacters.generateCharacterImage(p, req.params.charId, {
+        mode: req.body.mode || 'newPose',
+        instruction: req.body.instruction || '',
+        force: req.body.force === 'true' || req.body.force === true,
+      });
+    }
+  });
+  res.json({ project, character: updated });
+}));
+
+// --- Locations ---
+app.post('/api/cartoon/projects/:id/locations', ah(async (req, res) => {
+  let created;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    created = req.body?.instruction
+      ? await cartoonLocations.generateLocation(p, req.body.instruction)
+      : cartoonLocations.addLocation(p, req.body || {});
+  });
+  res.json({ project, location: created });
+}));
+
+app.patch('/api/cartoon/projects/:id/locations/:locId', ah(async (req, res) => {
+  let updated;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    updated = cartoonLocations.updateLocation(p, req.params.locId, req.body || {});
+  });
+  res.json({ project, location: updated });
+}));
+
+app.delete('/api/cartoon/projects/:id/locations/:locId', ah(async (req, res) => {
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    cartoonLocations.removeLocation(p, req.params.locId);
+  });
+  res.json({ project });
+}));
+
+app.post('/api/cartoon/projects/:id/locations/:locId/image', cartoonImageUpload.single('file'), ah(async (req, res) => {
+  let updated;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    if (req.file) {
+      updated = await cartoonLocations.setLocationImageFromUpload(p, req.params.locId, req.file.buffer, req.file.mimetype);
+    } else {
+      updated = await cartoonLocations.generateLocationImage(p, req.params.locId, {
+        mode: req.body.mode || 'newAngle',
+        instruction: req.body.instruction || '',
+        force: req.body.force === 'true' || req.body.force === true,
+      });
+    }
+  });
+  res.json({ project, location: updated });
+}));
+
+// --- Story / nursery rhyme / scenes ---
+app.post('/api/cartoon/projects/:id/story', ah(async (req, res) => {
+  let episode;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    episode = await cartoonStory.generateStory(p, {
+      mode: req.body.userStoryText ? 'user' : 'ai',
+      idea: req.body.idea || '',
+      userStoryText: req.body.userStoryText || '',
+    });
+  });
+  res.json({ project, episode });
+}));
+
+app.post('/api/cartoon/projects/:id/nursery-rhyme', ah(async (req, res) => {
+  let episode;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    episode = await cartoonStory.generateNurseryRhyme(p, { idea: req.body.idea || '', length: req.body.length });
+  });
+  res.json({ project, episode });
+}));
+
+app.post('/api/cartoon/projects/:id/episodes/:epId/scenes/:sceneId/regenerate', ah(async (req, res) => {
+  let scene;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    scene = await cartoonStory.regenerateScene(p, req.params.epId, req.params.sceneId, req.body?.instruction || '');
+  });
+  res.json({ project, scene });
+}));
+
+app.patch('/api/cartoon/projects/:id/episodes/:epId/scenes/:sceneId', ah(async (req, res) => {
+  let scene;
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    scene = cartoonStory.updateSceneManual(p, req.params.epId, req.params.sceneId, req.body || {});
+  });
+  res.json({ project, scene });
+}));
+
+app.post('/api/cartoon/projects/:id/episodes/:epId/scenes/reorder', ah(async (req, res) => {
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    cartoonStory.reorderScenes(p, req.params.epId, req.body?.sceneIds || []);
+  });
+  res.json({ project });
+}));
+
+app.delete('/api/cartoon/projects/:id/episodes/:epId', ah(async (req, res) => {
+  const project = await cartoonStore.withProject(req.session.userId, req.params.id, (p) => {
+    cartoonStory.removeEpisode(p, req.params.epId);
+  });
+  res.json({ project });
+}));
+
+// --- Video generation (Phase 2, Veo 3.1) ---
+app.get('/api/cartoon/video/available', (req, res) => res.json({ available: cartoonAi.isVideoAvailable() }));
+
+app.get('/api/cartoon/projects/:id/episodes/:epId/video/estimate', ah(async (req, res) => {
+  const project = await cartoonStore.getProject(req.session.userId, req.params.id);
+  const episode = cartoonStory.findEpisode(project, req.params.epId);
+  const tier = ['lite', 'fast', 'standard'].includes(req.query.tier) ? req.query.tier : 'lite';
+  res.json(cartoonVideo.estimateEpisodeCost(episode, tier));
+}));
+
+// Starts an async job that generates every scene's clip then stitches the episode. Returns
+// {jobId} immediately (mirrors POST /api/jobs/url's fire-and-forget shape); poll it via
+// GET /api/cartoon/video-jobs/:jobId. Real money is spent here — the frontend is required to
+// have already shown the /estimate figure and gotten explicit confirmation before calling this.
+app.post('/api/cartoon/projects/:id/episodes/:epId/video', ah(async (req, res) => {
+  if (!cartoonAi.isVideoAvailable()) throw new Error('Video generation is not configured (needs GOOGLE_GENERATIVE_AI_API_KEY).');
+  const tier = ['lite', 'fast', 'standard'].includes(req.body?.tier) ? req.body.tier : 'lite';
+  const project = await cartoonStore.getProject(req.session.userId, req.params.id);
+  const episode = cartoonStory.findEpisode(project, req.params.epId);
+
+  const jobId = cartoonStore.newId();
+  const job = {
+    id: jobId, status: 'running', kind: 'episode', episodeId: episode.id,
+    scenes: episode.scenes.map((s) => ({ sceneId: s.id, status: 'queued' })),
+    episodeVideoUrl: null, episodeCostUsd: null, totalSpendUsd: null, error: null,
+  };
+  cartoonVideoJobs.set(jobId, job);
+
+  cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    const ep = cartoonStory.findEpisode(p, req.params.epId);
+    await cartoonVideo.generateEpisodeVideo(p, ep, tier, (update) => {
+      if (update.status === 'stitching') { job.status = 'stitching'; return; }
+      const s = job.scenes.find((x) => x.sceneId === update.sceneId);
+      if (s) Object.assign(s, update);
+    });
+    return p;
+  }).then((savedProject) => {
+    const ep = cartoonStory.findEpisode(savedProject, req.params.epId);
+    job.status = 'done';
+    job.episodeVideoUrl = ep.videoUrl;
+    job.episodeCostUsd = ep.videoCostUsd;
+    job.totalSpendUsd = savedProject.videoSpend?.totalUsd ?? null;
+  }).catch((err) => {
+    console.error('[cartoon/video] episode job failed:', err.message);
+    job.status = 'error';
+    job.error = err.message;
+  });
+
+  res.json({ jobId });
+}));
+
+// Regenerates ONE scene's clip only. Does not auto-restitch the episode — the episode's
+// existing video is marked stale on save; the user re-runs the full episode job to pick it up.
+app.post('/api/cartoon/projects/:id/episodes/:epId/scenes/:sceneId/video', ah(async (req, res) => {
+  if (!cartoonAi.isVideoAvailable()) throw new Error('Video generation is not configured (needs GOOGLE_GENERATIVE_AI_API_KEY).');
+  const tier = ['lite', 'fast', 'standard'].includes(req.body?.tier) ? req.body.tier : 'lite';
+
+  const jobId = cartoonStore.newId();
+  const job = {
+    id: jobId, status: 'running', kind: 'scene', episodeId: req.params.epId,
+    scenes: [{ sceneId: req.params.sceneId, status: 'generating' }],
+    sceneVideoUrl: null, sceneCostUsd: null, totalSpendUsd: null, error: null,
+  };
+  cartoonVideoJobs.set(jobId, job);
+
+  cartoonStore.withProject(req.session.userId, req.params.id, async (p) => {
+    const ep = cartoonStory.findEpisode(p, req.params.epId);
+    const scene = cartoonStory.findScene(ep, req.params.sceneId);
+    await cartoonVideo.generateSingleSceneVideo(p, ep, scene, tier);
+    return p;
+  }).then((savedProject) => {
+    const ep = cartoonStory.findEpisode(savedProject, req.params.epId);
+    const scene = cartoonStory.findScene(ep, req.params.sceneId);
+    job.status = 'done';
+    job.scenes[0] = { sceneId: scene.id, status: 'done', videoUrl: scene.videoUrl, costUsd: scene.videoCostUsd };
+    job.sceneVideoUrl = scene.videoUrl;
+    job.sceneCostUsd = scene.videoCostUsd;
+    job.totalSpendUsd = savedProject.videoSpend?.totalUsd ?? null;
+  }).catch((err) => {
+    console.error('[cartoon/video] scene job failed:', err.message);
+    job.status = 'error';
+    job.error = err.message;
+    job.scenes[0] = { sceneId: req.params.sceneId, status: 'error', error: err.message };
+  });
+
+  res.json({ jobId });
+}));
+
+app.get('/api/cartoon/video-jobs/:jobId', (req, res) => {
+  const job = cartoonVideoJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json(job);
 });
 
 app.use('/output', express.static(OUTPUT_DIR));
