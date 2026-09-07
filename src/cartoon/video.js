@@ -6,7 +6,7 @@ const videoStitch = require('./videoStitch');
 
 // A single Veo call is capped at a short clip in this phase (disclosed limitation — no
 // frame-chaining across calls yet). 6s sits comfortably inside the proven 4-8s window.
-const SCENE_CLIP_DURATION_SEC = 6;
+const SCENE_CLIP_DURATION_SEC = 25;
 const RESOLUTION_TIER = '720p'; // pricing bucket used for both estimate and actual spend
 
 // Bounds total concurrent Veo calls across one episode generation run — same reasoning as
