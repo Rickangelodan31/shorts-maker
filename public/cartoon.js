@@ -82,26 +82,60 @@ async function refreshCurrentProject() {
 }
 
 // --- Project picker ---
+let allProjects = [];
+
 async function loadProjects() {
   try {
-    const projects = await cartoonFetch('/api/cartoon/projects');
-    const grid = document.getElementById('cartoon-projects-grid');
-    grid.innerHTML = '';
-    if (!projects.length) {
-      grid.innerHTML = '<p class="hint">No projects yet — create one below to get started.</p>';
-      return;
-    }
-    for (const p of projects) {
-      const tile = document.createElement('div');
-      tile.className = 'cartoon-project-tile';
-      tile.innerHTML = `<div class="cartoon-project-name">${escapeHtml(p.name)}</div><div class="cartoon-project-meta">Updated ${new Date(p.updatedAt).toLocaleDateString()}</div>`;
-      tile.addEventListener('click', () => openProject(p._id));
-      grid.appendChild(tile);
-    }
+    allProjects = await cartoonFetch('/api/cartoon/projects');
+    renderProjectList();
   } catch (err) {
     showCartoonError('Failed to load projects: ' + err.message);
   }
 }
+
+function projectInitial(name) {
+  return (name || '?').trim()[0]?.toUpperCase() || '?';
+}
+
+function renderProjectList() {
+  const grid = document.getElementById('cartoon-projects-grid');
+  const search = (document.getElementById('cartoon-projects-search').value || '').trim().toLowerCase();
+  const sortBy = document.getElementById('cartoon-projects-sort').value;
+
+  if (!allProjects.length) {
+    grid.innerHTML = '<p class="hint">No projects yet — create one below to get started.</p>';
+    return;
+  }
+
+  let filtered = search ? allProjects.filter((p) => (p.name || '').toLowerCase().includes(search)) : allProjects.slice();
+  filtered.sort((a, b) => {
+    if (sortBy === 'name') return (a.name || '').localeCompare(b.name || '');
+    if (sortBy === 'created') return new Date(b.createdAt) - new Date(a.createdAt);
+    return new Date(b.updatedAt) - new Date(a.updatedAt);
+  });
+
+  if (!filtered.length) {
+    grid.innerHTML = `<p class="hint">No projects match "${escapeHtml(search)}".</p>`;
+    return;
+  }
+
+  grid.innerHTML = '';
+  for (const p of filtered) {
+    const tile = document.createElement('div');
+    tile.className = 'cartoon-project-tile';
+    tile.innerHTML = `
+      <div class="cartoon-project-icon">${escapeHtml(projectInitial(p.name))}</div>
+      <div class="cartoon-project-info">
+        <div class="cartoon-project-name">${escapeHtml(p.name)}</div>
+        <div class="cartoon-project-meta">Updated ${new Date(p.updatedAt).toLocaleDateString()} &middot; Created ${new Date(p.createdAt).toLocaleDateString()}</div>
+      </div>`;
+    tile.addEventListener('click', () => openProject(p._id));
+    grid.appendChild(tile);
+  }
+}
+
+document.getElementById('cartoon-projects-search').addEventListener('input', renderProjectList);
+document.getElementById('cartoon-projects-sort').addEventListener('change', renderProjectList);
 
 document.getElementById('cartoon-new-project-btn').addEventListener('click', async () => {
   const nameInput = document.getElementById('cartoon-new-project-name');
@@ -645,7 +679,8 @@ function episodeCard(episode) {
       });
       pollCartoonVideoJob(jobId, (job) => {
         if (job.status === 'error') {
-          videoStatusEl.textContent = `Failed: ${job.error}`;
+          const sceneErrors = [...new Set((job.scenes || []).filter((s) => s.status === 'error' && s.error).map((s) => s.error))];
+          videoStatusEl.textContent = sceneErrors.length ? `Failed: ${sceneErrors.join(' | ')}` : `Failed: ${job.error}`;
           genVideoBtn.disabled = false;
           return;
         }
@@ -672,15 +707,16 @@ function episodeCard(episode) {
 
 function renderEpisodes() {
   const el = document.getElementById('cartoon-episodes-list');
-  const spend = currentProject.videoSpend || { totalUsd: 0, log: [] };
+  const spend = currentProject.spend || currentProject.videoSpend || { totalUsd: 0, log: [] };
   el.innerHTML = `
     <div class="cartoon-phase-banner">
       <strong>Script, visuals &amp; video.</strong> Each scene below is a full storyboard panel — location image,
       characters, dialogue, camera direction. Once a scene looks right, generate a real animated clip for it
-      (Veo 3.1) and stitch the episode together to get a playable video. Video generation costs real money per
-      run, so you'll always see a cost estimate and have to confirm before anything is generated.
+      (Veo 3.1) and stitch the episode together to get a playable video. Every AI generation in this project
+      (story/character/location text, reference images, and video) costs real money, so you'll always see a
+      cost estimate and have to confirm before anything expensive is generated.
     </div>
-    <div class="cartoon-spend-tracker">Project video spend so far: <strong>${formatUsd(spend.totalUsd)}</strong></div>`;
+    <div class="cartoon-spend-tracker">Total AI spend on this project so far: <strong>${formatUsd(spend.totalUsd)}</strong></div>`;
   if (!currentProject.episodes.length) {
     el.innerHTML += '<p class="hint">No episodes yet — use "Create Story / Rhyme" to generate your first one.</p>';
     return;

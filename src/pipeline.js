@@ -291,6 +291,10 @@ async function renderOneClip(job, ctx, entry, candidateIndex) {
     faceCount: Math.max(0, ...layoutTimeline.map((c) => c.people.faceCount)),
     layoutSwitches: segments.filter((s) => !s.tag).length - 1,
     effect: segments.find((s) => s.tag)?.tag || null,
+    // A short, real description of what this clip is about — the semantic pass already
+    // produces this to help pick/rank cuts; surfacing it here lets the frontend pre-fill a
+    // real caption when posting to a platform instead of always sending an empty string.
+    caption: cand.semanticEvent?.topic_summary || null,
     candidateIndex,
     segments, // persisted for the manual editor — GET .../timeline reads this
     visionChecked: cand.visionChecked,

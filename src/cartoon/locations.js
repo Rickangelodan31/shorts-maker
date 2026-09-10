@@ -1,6 +1,7 @@
 const { newId } = require('./store');
 const ai = require('./ai');
 const blob = require('./blob');
+const spend = require('./spend');
 const { locationGenSchema } = require('./schemas');
 const { styleDescription } = require('./style');
 
@@ -31,12 +32,13 @@ async function generateLocation(project, instruction) {
     `Visual style: ${styleDescription(project.style)}. ` +
     `Existing locations in this project (do not duplicate any of them): ${existingNames}. ` +
     `Create a wholesome, original location — never copy a real/existing show's backgrounds or proprietary designs.`;
-  const location = await ai.generateStructured({
+  const { object: location, costUsd } = await ai.generateStructured({
     system,
     prompt: instruction || 'Create a fitting new location for this project.',
     schema: locationGenSchema,
     schemaName: 'location',
   });
+  spend.record(project, { kind: 'text', context: `location-generate:${location.name}`, costUsd });
   return addLocation(project, location);
 }
 
@@ -73,12 +75,13 @@ async function generateLocationImage(project, locId, { mode = 'newAngle', instru
       const system = `You are updating ONE existing children's cartoon location's description based on a specific ` +
         `requested change. Keep everything else identical — only change what the instruction asks for. ` +
         `Current description: ${describeLocation(location)}`;
-      const updated = await ai.generateStructured({
+      const { object: updated, costUsd: redesignCostUsd } = await ai.generateStructured({
         system,
         prompt: `Requested change: ${instruction}. Return the location's full updated name + description.`,
         schema: locationGenSchema,
         schemaName: 'location_redesign',
       });
+      spend.record(project, { kind: 'text', context: `location-redesign:${location.name}`, costUsd: redesignCostUsd });
       updateLocation(project, locId, updated);
     }
   }
@@ -87,7 +90,8 @@ async function generateLocationImage(project, locId, { mode = 'newAngle', instru
   const prompt = `Location/background reference image, ${styleDescription(project.style)}. ${describeLocation(location)}${anglePrompt} ` +
     `Wide establishing shot suitable for reuse as a consistent background across scenes.`;
 
-  const { buffer, contentType } = await ai.generateReferenceImage({ prompt });
+  const { buffer, contentType, costUsd } = await ai.generateReferenceImage({ prompt });
+  spend.record(project, { kind: 'image', context: `location-image:${location.name}:${mode}`, costUsd });
   const url = await blob.uploadReferenceImage({ projectId: project._id, kind: 'locations', entityId: location.id, buffer, contentType });
   await blob.deleteReferenceImage(location.referenceImageUrl);
   location.referenceImageUrl = url;

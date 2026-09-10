@@ -1,6 +1,7 @@
 const fs = require('fs');
 const ai = require('./ai');
 const blob = require('./blob');
+const spend = require('./spend');
 const { styleDescription } = require('./style');
 const videoStitch = require('./videoStitch');
 
@@ -38,22 +39,12 @@ function estimateEpisodeCost(episode, tier) {
   return { estimatedCostUsd, totalDurationSec, perSceneSeconds, tier };
 }
 
-// Recomputes episode.videoCostUsd (sum of its scenes' actual costs) and
-// project.videoSpend.totalUsd (sum across all episodes) from scratch every time, rather than
-// incrementally accumulating — self-correcting against regenerations, partial failures, and
-// any future manual edits, at the cost of a cheap O(scenes) pass.
-function recomputeSpend(project) {
-  if (!project.videoSpend) project.videoSpend = { totalUsd: 0, log: [] };
-  for (const ep of project.episodes) {
-    ep.videoCostUsd = round2((ep.scenes || []).reduce((sum, s) => sum + (s.videoCostUsd || 0), 0));
-  }
-  project.videoSpend.totalUsd = round2(project.episodes.reduce((sum, ep) => sum + (ep.videoCostUsd || 0), 0));
-}
-
-function logSpend(project, entry) {
-  if (!project.videoSpend) project.videoSpend = { totalUsd: 0, log: [] };
-  project.videoSpend.log.push({ ...entry, at: new Date().toISOString() });
-  if (project.videoSpend.log.length > 200) project.videoSpend.log = project.videoSpend.log.slice(-200);
+// episode.videoCostUsd reflects the cost of the CURRENTLY stored clips only (recomputed from
+// scratch each time) — a display convenience, separate from project.spend.totalUsd (the real,
+// monotonic running total of everything ever actually spent, tracked via spend.record below,
+// which correctly still counts money spent on a scene that was later regenerated/discarded).
+function recomputeCurrentEpisodeCost(episode) {
+  episode.videoCostUsd = round2((episode.scenes || []).reduce((sum, s) => sum + (s.videoCostUsd || 0), 0));
 }
 
 async function fetchImageBuffer(url) {
@@ -107,7 +98,7 @@ async function generateSceneVideoForScene(project, episode, scene, tier) {
   }
 
   const prompt = buildScenePrompt(project, scene, location, sceneCharacters);
-  const { buffer, contentType } = await ai.generateSceneVideo({
+  const { buffer, contentType, costUsd } = await ai.generateSceneVideo({
     prompt, tier, durationSec: SCENE_CLIP_DURATION_SEC, aspectRatio: '9:16', referenceImage,
   });
   const url = await blob.uploadVideo({ projectId: project._id, kind: 'scenes', entityId: scene.id, buffer, contentType });
@@ -117,7 +108,8 @@ async function generateSceneVideoForScene(project, episode, scene, tier) {
   scene.videoStatus = 'done';
   scene.videoTier = tier;
   scene.videoError = null;
-  scene.videoCostUsd = round2(SCENE_CLIP_DURATION_SEC * pricePerSec(tier));
+  scene.videoCostUsd = round2(costUsd);
+  spend.record(project, { kind: 'video', context: `scene-video:${episode.title}`, tier, sceneId: scene.id, costUsd });
   return scene;
 }
 
@@ -127,11 +119,7 @@ async function generateSceneVideoForScene(project, episode, scene, tier) {
 async function generateSingleSceneVideo(project, episode, scene, tier) {
   await generateSceneVideoForScene(project, episode, scene, tier);
   if (episode.videoUrl) episode.videoStatus = 'stale';
-  recomputeSpend(project);
-  logSpend(project, {
-    kind: 'scene-regen', episodeId: episode.id, title: episode.title, sceneId: scene.id,
-    costUsd: scene.videoCostUsd, totalAfterUsd: project.videoSpend.totalUsd,
-  });
+  recomputeCurrentEpisodeCost(episode);
   return scene;
 }
 
@@ -149,6 +137,7 @@ async function generateEpisodeVideo(project, episode, tier, onProgress) {
       await generateSceneVideoForScene(project, episode, scene, tier);
       onProgress?.({ sceneId: scene.id, status: 'done', videoUrl: scene.videoUrl, costUsd: scene.videoCostUsd });
     } catch (err) {
+      console.error(`[cartoon/video] scene ${scene.id} failed:`, err.message);
       scene.videoStatus = 'error';
       scene.videoError = err.message;
       onProgress?.({ sceneId: scene.id, status: 'error', error: err.message });
@@ -175,22 +164,18 @@ async function generateEpisodeVideo(project, episode, tier, onProgress) {
     fs.unlink(stitchedPath, () => {});
   }
 
-  recomputeSpend(project);
-  logSpend(project, {
-    kind: 'episode', episodeId: episode.id, title: episode.title, tier,
-    costUsd: episode.videoCostUsd, scenesGenerated: doneScenes.length, scenesTotal: scenesSorted.length,
-    totalAfterUsd: project.videoSpend.totalUsd,
-  });
+  recomputeCurrentEpisodeCost(episode);
+  const totalSpendUsd = spend.ensureSpend(project).totalUsd;
 
   return {
     episodeUrl: episode.videoUrl,
     scenesCompleted: doneScenes.length,
     scenesTotal: scenesSorted.length,
     episodeCostUsd: episode.videoCostUsd,
-    totalSpendUsd: project.videoSpend.totalUsd,
+    totalSpendUsd,
   };
 }
 
 module.exports = {
-  SCENE_CLIP_DURATION_SEC, estimateEpisodeCost, generateEpisodeVideo, generateSingleSceneVideo, recomputeSpend,
+  SCENE_CLIP_DURATION_SEC, estimateEpisodeCost, generateEpisodeVideo, generateSingleSceneVideo,
 };

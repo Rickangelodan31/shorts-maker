@@ -509,7 +509,7 @@ app.post('/api/cartoon/projects/:id/episodes/:epId/video', ah(async (req, res) =
     job.status = 'done';
     job.episodeVideoUrl = ep.videoUrl;
     job.episodeCostUsd = ep.videoCostUsd;
-    job.totalSpendUsd = savedProject.videoSpend?.totalUsd ?? null;
+    job.totalSpendUsd = savedProject.spend?.totalUsd ?? null;
   }).catch((err) => {
     console.error('[cartoon/video] episode job failed:', err.message);
     job.status = 'error';
@@ -545,7 +545,7 @@ app.post('/api/cartoon/projects/:id/episodes/:epId/scenes/:sceneId/video', ah(as
     job.scenes[0] = { sceneId: scene.id, status: 'done', videoUrl: scene.videoUrl, costUsd: scene.videoCostUsd };
     job.sceneVideoUrl = scene.videoUrl;
     job.sceneCostUsd = scene.videoCostUsd;
-    job.totalSpendUsd = savedProject.videoSpend?.totalUsd ?? null;
+    job.totalSpendUsd = savedProject.spend?.totalUsd ?? null;
   }).catch((err) => {
     console.error('[cartoon/video] scene job failed:', err.message);
     job.status = 'error';

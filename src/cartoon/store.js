@@ -20,7 +20,7 @@ async function createProject(ownerId, name) {
     characters: [],
     locations: [],
     episodes: [],
-    videoSpend: { totalUsd: 0, log: [] },
+    spend: { totalUsd: 0, log: [] },
   };
   await col.insertOne(project);
   return project;
@@ -60,9 +60,19 @@ async function deleteProject(ownerId, projectId) {
 // Mongo instead of a JSON file.
 async function withProject(ownerId, projectId, mutator) {
   const project = await getProject(ownerId, projectId);
-  const result = (await mutator(project)) || project;
-  await saveProject(result);
-  return result;
+  try {
+    const result = (await mutator(project)) || project;
+    await saveProject(result);
+    return result;
+  } catch (err) {
+    // The mutator may have already mutated `project` in place before failing (e.g. a video
+    // generation job that set per-scene error details on some scenes before the batch as a
+    // whole was deemed a failure) — best-effort persist that partial state instead of
+    // silently discarding it, so the real failure reason survives for the caller to inspect
+    // later, not just the in-memory job object. Then rethrow so callers still see the error.
+    await saveProject(project).catch(() => {});
+    throw err;
+  }
 }
 
 module.exports = { newId, createProject, listProjects, getProject, saveProject, deleteProject, withProject };

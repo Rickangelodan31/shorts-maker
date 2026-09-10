@@ -1,6 +1,7 @@
 const { newId } = require('./store');
 const ai = require('./ai');
 const blob = require('./blob');
+const spend = require('./spend');
 const { characterGenSchema } = require('./schemas');
 const { styleDescription } = require('./style');
 
@@ -63,12 +64,13 @@ async function generateCharacter(project, instruction) {
     `Visual style: ${styleDescription(project.style)}. ` +
     `Existing characters in this project (do not duplicate or closely imitate any of them): ${existingNames}. ` +
     `Create a wholesome, original character — never copy a real/existing show's characters, names, or designs.`;
-  const character = await ai.generateStructured({
+  const { object: character, costUsd } = await ai.generateStructured({
     system,
     prompt: instruction || 'Create a fun, original supporting character for this project.',
     schema: characterGenSchema,
     schemaName: 'character',
   });
+  spend.record(project, { kind: 'text', context: `character-generate:${character.name}`, costUsd });
   return addCharacter(project, character);
 }
 
@@ -116,12 +118,13 @@ async function generateCharacterImage(project, charId, { mode = 'newPose', instr
       const system = `You are updating ONE existing children's cartoon character's visual design based on a specific ` +
         `requested change. Keep everything else about them identical — only change what the instruction asks for. ` +
         `Current design: ${describeCharacter(character)}`;
-      const updatedFields = await ai.generateStructured({
+      const { object: updatedFields, costUsd: redesignCostUsd } = await ai.generateStructured({
         system,
         prompt: `Requested change: ${instruction}. Return the character's full updated field set (name/personality/voice etc. stay the same unless the instruction says otherwise).`,
         schema: characterGenSchema,
         schemaName: 'character_redesign',
       });
+      spend.record(project, { kind: 'text', context: `character-redesign:${character.name}`, costUsd: redesignCostUsd });
       updateCharacter(project, charId, updatedFields);
     }
   }
@@ -130,7 +133,8 @@ async function generateCharacterImage(project, charId, { mode = 'newPose', instr
   const prompt = `Character reference image, ${styleDescription(project.style)}. ${describeCharacter(character)}${posePrompt} ` +
     `Clean single-character reference image on a simple background, consistent with a warm children's animated show.`;
 
-  const { buffer, contentType } = await ai.generateReferenceImage({ prompt });
+  const { buffer, contentType, costUsd } = await ai.generateReferenceImage({ prompt });
+  spend.record(project, { kind: 'image', context: `character-image:${character.name}:${mode}`, costUsd });
   const url = await blob.uploadReferenceImage({ projectId: project._id, kind: 'characters', entityId: character.id, buffer, contentType });
   await blob.deleteReferenceImage(character.referenceImageUrl);
   character.referenceImageUrl = url;

@@ -69,7 +69,7 @@
         <div class="option">
           <label for="aspect-preset">Output size</label>
           <select id="aspect-preset">
-            <option value="1080x1920" selected>Vertical 9:16 (1080&times;1920)</option>
+            <option value="1080x1920" selected>Shorts / TikTok / Reels (9:16, 1080&times;1920)</option>
             <option value="1080x1080">Square 1:1 (1080&times;1080)</option>
             <option value="1920x1080">Landscape 16:9 (1920&times;1080)</option>
             <option value="custom">Custom&hellip;</option>
@@ -109,6 +109,14 @@
     <section class="card" id="cartoon-projects-card">
       <h2>Your Projects</h2>
       <p class="hint">Each project keeps its own Character Library, Location Library, Story Bible, and episodes &mdash; the same characters, voices-to-be, and world carry across every episode in a project.</p>
+      <div class="cartoon-projects-toolbar">
+        <input id="cartoon-projects-search" type="text" placeholder="Search projects by name&hellip;" />
+        <select id="cartoon-projects-sort">
+          <option value="updated" selected>Recently updated</option>
+          <option value="created">Recently created</option>
+          <option value="name">Name A&ndash;Z</option>
+        </select>
+      </div>
       <div id="cartoon-projects-grid" class="cartoon-projects-grid"></div>
       <div class="cartoon-new-project-row">
         <input id="cartoon-new-project-name" type="text" placeholder="New project name (e.g. Max &amp; Friends)" />

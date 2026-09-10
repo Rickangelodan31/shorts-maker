@@ -122,15 +122,19 @@ function peopleNote(faceCount, layoutSwitches) {
   return layoutSwitches > 0 ? `${base} (switches ${layoutSwitches}x)` : base;
 }
 
-async function postToSocial(clipUrl, platform, btn, select) {
+async function postToSocial(clipUrl, platform, caption, btn) {
   btn.disabled = true;
   const original = btn.textContent;
   btn.textContent = 'Posting...';
   try {
+    // Instagram's API fetches the video from a public URL rather than accepting an uploaded
+    // file (unlike YouTube/TikTok, which read the rendered file straight off disk server-side)
+    // — clipUrl is only a relative /output/... path, so build the absolute URL Instagram needs.
+    const videoUrl = new URL(clipUrl, window.location.origin).href;
     const res = await fetch('/api/social/post', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ platform, clipUrl, title: 'Short', caption: '' }),
+      body: JSON.stringify({ platform, clipUrl, videoUrl, title: caption ? caption.slice(0, 90) : 'Short', caption }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Post failed');
@@ -151,8 +155,11 @@ function renderCard(entry, jobId) {
     const connectedNames = Object.keys(connectedPlatforms).filter((p) => connectedPlatforms[p].connected);
     const postControls = connectedNames.length
       ? `<div class="post-row">
-          <select class="post-platform">${connectedNames.map((p) => `<option value="${p}">${PLATFORM_LABELS[p]}</option>`).join('')}</select>
-          <button class="post-btn">Post</button>
+          <textarea class="post-caption" rows="2" placeholder="Caption for this post&hellip;"></textarea>
+          <div class="post-row-controls">
+            <select class="post-platform">${connectedNames.map((p) => `<option value="${p}">${PLATFORM_LABELS[p]}</option>`).join('')}</select>
+            <button class="post-btn">Post</button>
+          </div>
         </div>`
       : '';
     div.innerHTML = `
@@ -167,9 +174,14 @@ function renderCard(entry, jobId) {
       <div class="editor-panel hidden"></div>
     `;
     if (connectedNames.length) {
+      // Set via the DOM property (not embedded in the template string above) so the
+      // AI-generated caption text can't break out of the HTML regardless of what characters
+      // it contains — no manual escaping needed this way.
+      div.querySelector('.post-caption').value = entry.caption || '';
       const select = div.querySelector('.post-platform');
+      const captionInput = div.querySelector('.post-caption');
       const btn = div.querySelector('.post-btn');
-      btn.addEventListener('click', () => postToSocial(entry.url, select.value, btn, select));
+      btn.addEventListener('click', () => postToSocial(entry.url, select.value, captionInput.value, btn));
     }
     const editBtn = div.querySelector('.edit-layout-btn');
     const panel = div.querySelector('.editor-panel');

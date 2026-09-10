@@ -77,10 +77,22 @@ header {
 
 .post-row {
   display: flex;
+  flex-direction: column;
   gap: 6px;
   margin-top: 8px;
 }
-.post-row select {
+.post-caption {
+  padding: 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #0e1016;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-family: inherit;
+  resize: vertical;
+}
+.post-row-controls { display: flex; gap: 6px; }
+.post-row-controls select {
   flex: 1;
   padding: 6px;
   border-radius: 6px;
@@ -89,7 +101,7 @@ header {
   color: var(--text);
   font-size: 0.78rem;
 }
-.post-row button {
+.post-row-controls button {
   padding: 6px 10px;
   border-radius: 6px;
   border: none;
@@ -98,7 +110,7 @@ header {
   cursor: pointer;
   font-size: 0.78rem;
 }
-.post-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+.post-row-controls button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 h1 {
   margin: 0 0 8px;
@@ -505,17 +517,49 @@ main {
 .app-tab.active { background: var(--accent); border-color: var(--accent); color: var(--text); }
 .app-panel.hidden { display: none; }
 
-.cartoon-projects-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 12px; }
-.cartoon-project-tile {
+.cartoon-projects-toolbar { display: flex; gap: 8px; margin-top: 14px; }
+.cartoon-projects-toolbar input {
+  flex: 1;
+  padding: 10px;
+  border-radius: 8px;
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px;
+  background: var(--panel);
+  color: var(--text);
+}
+.cartoon-projects-toolbar select {
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.cartoon-projects-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-top: 14px; }
+.cartoon-project-tile {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
   background: #0e1016;
   cursor: pointer;
+  transition: transform 0.1s ease, border-color 0.1s ease;
 }
-.cartoon-project-tile:hover { border-color: var(--accent); }
-.cartoon-project-name { font-weight: 600; }
-.cartoon-project-meta { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+.cartoon-project-tile:hover { border-color: var(--accent); transform: translateY(-2px); }
+.cartoon-project-icon {
+  flex: 0 0 auto;
+  width: 40px; height: 40px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--text);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+.cartoon-project-info { min-width: 0; }
+.cartoon-project-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cartoon-project-meta { color: var(--muted); font-size: 0.75rem; margin-top: 4px; }
 
 .cartoon-new-project-row { display: flex; gap: 8px; margin-top: 16px; }
 .cartoon-new-project-row input {
@@ -624,7 +668,7 @@ main {
 .cartoon-episode-card { border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; background: #0e1016; }
 .cartoon-episode-header { display: flex; justify-content: space-between; align-items: center; }
 .cartoon-lyrics { background: var(--panel); border-radius: 8px; padding: 10px; font-size: 0.85rem; margin: 10px 0; line-height: 1.6; }
-.cartoon-scenes-list { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.cartoon-scenes-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 10px; align-items: start; }
 .cartoon-scene-card { border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: var(--bg); }
 .cartoon-scene-header { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .cartoon-scene-meta { color: var(--muted); font-size: 0.78rem; }

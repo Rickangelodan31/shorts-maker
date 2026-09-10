@@ -1,5 +1,6 @@
 const { newId } = require('./store');
 const ai = require('./ai');
+const spend = require('./spend');
 const characters = require('./characters');
 const locations = require('./locations');
 const { styleDescription } = require('./style');
@@ -131,7 +132,8 @@ async function generateStory(project, { mode, idea, userStoryText }) {
     prompt = `Idea: ${idea}`;
   }
 
-  const generated = await ai.generateStructured({ system, prompt, schema: storyGenSchema, schemaName: 'story' });
+  const { object: generated, costUsd } = await ai.generateStructured({ system, prompt, schema: storyGenSchema, schemaName: 'story' });
+  spend.record(project, { kind: 'text', context: `story-generate:${generated.title}`, costUsd });
   resolveEntities(project, generated);
   const scenes = generated.scenes.map((s, i) => resolveScene(project, s, i));
 
@@ -168,7 +170,8 @@ async function generateNurseryRhyme(project, { idea, length }) {
     `breakdown showing what happens and who's on screen during each part. ${lengthInstruction}`;
   const prompt = `Nursery rhyme idea: ${idea}`;
 
-  const generated = await ai.generateStructured({ system, prompt, schema: nurseryRhymeGenSchema, schemaName: 'nursery_rhyme' });
+  const { object: generated, costUsd } = await ai.generateStructured({ system, prompt, schema: nurseryRhymeGenSchema, schemaName: 'nursery_rhyme' });
+  spend.record(project, { kind: 'text', context: `nursery-rhyme-generate:${generated.title}`, costUsd });
   resolveEntities(project, generated);
   const scenes = generated.scenes.map((s, i) => resolveScene(project, s, i));
 
@@ -223,7 +226,8 @@ async function regenerateScene(project, episodeId, sceneId, instruction) {
     ? `Regenerate this scene. Instruction: ${instruction}`
     : 'Regenerate this scene with fresh creative details, keeping location, characters, and story continuity exactly the same.';
 
-  const generated = await ai.generateStructured({ system, prompt, schema, schemaName: 'scene_regen' });
+  const { object: generated, costUsd } = await ai.generateStructured({ system, prompt, schema, schemaName: 'scene_regen' });
+  spend.record(project, { kind: 'text', context: `scene-regen:${episode.title}`, costUsd });
   const dialogue = (generated.dialogue || [])
     .map((d) => ({ characterId: findCharacterIdByName(project, d.characterName), line: d.line }))
     .filter((d) => d.characterId);
