@@ -2,8 +2,8 @@ const os = require('os');
 const { run, FFMPEG_BIN, HAS_CAPTIONS, HAS_VIDEOTOOLBOX } = require('./ffutil');
 const {
   OUT_W: DEFAULT_OUT_W, OUT_H: DEFAULT_OUT_H,
-  evenify, cropBoxFor, cropBoxForRegion,
-  FACE_CROP_MARGIN_STEPS, CONTENT_CROP_MARGIN, INSET_FACE_AR,
+  evenify, cropBoxFor, cropBoxForRegion, regionBoundedCropBox, regionToPixelBox,
+  FACE_CROP_MARGIN_STEPS, INSET_FACE_AR,
 } = require('./geometry');
 
 // When several clips render concurrently, cap each ffmpeg's thread count so they share
@@ -13,6 +13,31 @@ const THREADS_PER_RENDER = Math.max(2, Math.floor(os.cpus().length / 3));
 const XFADE_DUR = 0.35;
 const USE_HW_ENCODE = HAS_VIDEOTOOLBOX && process.env.DISABLE_HW_ENCODE !== '1';
 const HW_BITRATE = process.env.RENDER_VIDEO_BITRATE || '8M';
+
+// Content-preserving "fit": optionally crops to a source region first (box — a normalized
+// center-based {cx,cy,w,h}; pass null to use the whole frame), then contains that region
+// inside targetW x targetH with a blurred, cropped-to-fill copy of the SAME pixels as
+// background filler instead of hard-cropping whatever doesn't match the target AR. Shared
+// by the whole-frame 'fit' layout and by reaction-split/reaction-inset's content half,
+// which is exactly why it's parametrized on an arbitrary (vBase, vOut) pair rather than
+// assuming it's the only thing happening in the filter graph.
+function fitBoxFilter(vBase, vOut, box, srcW, srcH, targetW, targetH) {
+  const parts = [];
+  let src = `[${vBase}]`;
+  if (box) {
+    const region = regionToPixelBox(srcW, srcH, box);
+    parts.push(`${src}crop=${region.w}:${region.h}:${region.x}:${region.y}[${vBase}reg]`);
+    src = `[${vBase}reg]`;
+  }
+  parts.push(`${src}split=2[${vBase}bg][${vBase}fg]`);
+  parts.push(
+    `[${vBase}bg]scale=${targetW}:${targetH}:force_original_aspect_ratio=increase,` +
+    `crop=${targetW}:${targetH},gblur=sigma=25[${vBase}bgblur]`
+  );
+  parts.push(`[${vBase}fg]scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease[${vBase}fgfit]`);
+  parts.push(`[${vBase}bgblur][${vBase}fgfit]overlay=(W-w)/2:(H-h)/2,setsar=1[${vOut}]`);
+  return parts;
+}
 
 // Builds the filter_complex for one segment's layout (single crop, split-screen, fit, or a
 // reaction/facecam-composite layout), operating on an already-trimmed/retimed stream label.
@@ -47,43 +72,64 @@ function layoutFilter(vBase, layout, srcW, srcH, outW = DEFAULT_OUT_W, outH = DE
     // rather than small-with-lots-of-background.
     const faceMargin = layout.faceMargin ?? FACE_CROP_MARGIN_STEPS[0];
     const faceCrop = cropBoxForRegion(srcW, srcH, layout.faceBox, targetAR, faceMargin);
-    const contentCrop = cropBoxForRegion(srcW, srcH, layout.contentBox, targetAR, CONTENT_CROP_MARGIN);
     parts.push(`[${vBase}]split=2[${vBase}x][${vBase}y]`);
     parts.push(`[${vBase}x]crop=${faceCrop.w}:${faceCrop.h}:${faceCrop.x}:${faceCrop.y},scale=${outW}:${bandH},setsar=1[${vBase}p1]`);
-    parts.push(`[${vBase}y]crop=${contentCrop.w}:${contentCrop.h}:${contentCrop.x}:${contentCrop.y},scale=${outW}:${bandH},setsar=1[${vBase}p2]`);
+    // The content half gets its OWN framing decision (effects.js:decideContentFraming) —
+    // a cover-crop when little would be lost, or a content-preserving contain+blur fit
+    // when a crop would have to cut off gameplay/UI/action to fill the band. Both branches
+    // must still land in exactly outW x bandH so the vstack below lines up.
+    if (layout.contentFraming?.mode === 'fit') {
+      parts.push(...fitBoxFilter(`${vBase}y`, `${vBase}p2`, layout.contentBox, srcW, srcH, outW, bandH));
+    } else {
+      // regionBoundedCropBox, NOT cropBoxForRegion: the content box's own edge IS the
+      // boundary with the reactor's excluded region — a crop that grows past it (which
+      // cropBoxForRegion does deliberately, for face margins) would bleed the reactor's
+      // pixels into the content panel instead of showing content.
+      const contentCrop = regionBoundedCropBox(srcW, srcH, layout.contentBox, targetAR);
+      parts.push(`[${vBase}y]crop=${contentCrop.w}:${contentCrop.h}:${contentCrop.x}:${contentCrop.y},scale=${outW}:${bandH},setsar=1[${vBase}p2]`);
+    }
     parts.push(`[${vBase}p1][${vBase}p2]vstack=inputs=2[${vOut}]`);
   } else if (layout.type === 'reaction-inset') {
     // Content fills the frame; a small fixed-position (bottom-right) face inset overlays
     // it — used when the facecam is small relative to the content. Plain rectangular PiP
     // for v1; rounded corners/border are a deferred nice-to-have, not implemented here.
-    const contentCrop = cropBoxForRegion(srcW, srcH, layout.contentBox, outW / outH, CONTENT_CROP_MARGIN);
     const faceMargin = layout.faceMargin ?? FACE_CROP_MARGIN_STEPS[0];
     const faceCrop = cropBoxForRegion(srcW, srcH, layout.faceBox, INSET_FACE_AR, faceMargin);
     const insetW = evenify(outW * 0.42);
     const insetH = evenify(insetW / INSET_FACE_AR);
     const marginPx = 40;
     parts.push(`[${vBase}]split=2[${vBase}bg][${vBase}fg]`);
-    parts.push(`[${vBase}bg]crop=${contentCrop.w}:${contentCrop.h}:${contentCrop.x}:${contentCrop.y},scale=${outW}:${outH},setsar=1[${vBase}bgout]`);
+    // Same content-preserving decision as reaction-split's content half, just filling the
+    // whole canvas instead of one band since there's no separate content panel here.
+    if (layout.contentFraming?.mode === 'fit') {
+      parts.push(...fitBoxFilter(`${vBase}bg`, `${vBase}bgout`, layout.contentBox, srcW, srcH, outW, outH));
+    } else {
+      // See the reaction-split content branch above: bounded-within-region, never grown
+      // past the content box's own edge into the reactor's excluded territory.
+      const contentCrop = regionBoundedCropBox(srcW, srcH, layout.contentBox, outW / outH);
+      parts.push(`[${vBase}bg]crop=${contentCrop.w}:${contentCrop.h}:${contentCrop.x}:${contentCrop.y},scale=${outW}:${outH},setsar=1[${vBase}bgout]`);
+    }
     parts.push(`[${vBase}fg]crop=${faceCrop.w}:${faceCrop.h}:${faceCrop.x}:${faceCrop.y},scale=${insetW}:${insetH},setsar=1[${vBase}fgout]`);
     parts.push(`[${vBase}bgout][${vBase}fgout]overlay=W-w-${marginPx}:H-h-${marginPx}[${vOut}]`);
   } else if (layout.type === 'fit') {
-    // Show the WHOLE frame (nobody cropped out) letterboxed over a blurred, zoomed-in copy
-    // of the same frame as filler — used when a hard crop would have to cut someone off.
-    parts.push(`[${vBase}]split=2[${vBase}bg][${vBase}fg]`);
-    parts.push(
-      `[${vBase}bg]scale=${outW}:${outH}:force_original_aspect_ratio=increase,` +
-      `crop=${outW}:${outH},gblur=sigma=25[${vBase}bgblur]`
-    );
-    parts.push(`[${vBase}fg]scale=${outW}:${outH}:force_original_aspect_ratio=decrease[${vBase}fgfit]`);
-    parts.push(`[${vBase}bgblur][${vBase}fgfit]overlay=(W-w)/2:(H-h)/2,setsar=1[${vOut}]`);
+    // Show the WHOLE frame (or, if layout.box is set, just that source region — see
+    // effects.js:buildContentOnlyLayout) letterboxed over a blurred, zoomed-in copy of the
+    // same pixels as filler — used whenever a hard crop would have to cut off someone's
+    // face, or (content regions) would destroy gameplay/UI/action that must stay visible.
+    parts.push(...fitBoxFilter(vBase, vOut, layout.box || null, srcW, srcH, outW, outH));
   } else {
     // Manually-edited segments (see effects.js:mapUserTypeToLayout) attach `manualCrop`, a
     // sized region (so a zoom nudge has something to act on) — auto-generated 'single'
     // layouts never set this and keep the original fixed-max-size crop unchanged.
+    // `regionBounded` (see effects.js:buildContentOnlyLayout) marks a manualCrop that is a
+    // content region carved out by contentRegionExcludingFacecam — must stay bounded within
+    // its own footprint, same reasoning as reaction-split/reaction-inset's content branch.
     const targetAR = outW / outH;
-    const box = layout.manualCrop
-      ? cropBoxForRegion(srcW, srcH, layout.manualCrop, targetAR, layout.manualCropMargin ?? 0.15)
-      : cropBoxFor(srcW, srcH, layout.slot.cx, layout.slot.cy, targetAR);
+    const box = layout.regionBounded
+      ? regionBoundedCropBox(srcW, srcH, layout.manualCrop, targetAR)
+      : layout.manualCrop
+        ? cropBoxForRegion(srcW, srcH, layout.manualCrop, targetAR, layout.manualCropMargin ?? 0.15)
+        : cropBoxFor(srcW, srcH, layout.slot.cx, layout.slot.cy, targetAR);
     parts.push(`[${vBase}]crop=${box.w}:${box.h}:${box.x}:${box.y},scale=${outW}:${outH},setsar=1[${vOut}]`);
   }
   return { parts, vOut };

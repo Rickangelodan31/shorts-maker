@@ -12,6 +12,7 @@ const { renderSegmented } = require('./render');
 const { planClipSegments, mapUserTypeToLayout } = require('./effects');
 const { buildCaptionsAss } = require('./captions');
 const { probeUrlMeta, downloadAudioOnly, downloadSection } = require('./ingest');
+const captionAi = require('./captionAi/generator');
 
 const OUTPUT_DIR = path.join(__dirname, '..', 'output');
 const TMP_DIR = path.join(__dirname, '..', 'tmp');
@@ -236,6 +237,9 @@ async function renderOneClip(job, ctx, entry, candidateIndex) {
       end: Math.min(win.length, w.end - win.start),
       text: w.text,
     }));
+  // Persisted (not just used once) so the AI hook generator can reuse this transcript after
+  // render without re-deriving it — see src/captionAi/analyzer.js.
+  cand.localWords = localWords;
 
   let hookSplice = null;
   const hook = cand.visionReport?.hook;
@@ -309,6 +313,12 @@ async function renderOneClip(job, ctx, entry, candidateIndex) {
   });
   entry.qualityConfidenceScore = Object.values(entry.qualityConfidence).filter(Boolean).length / Object.keys(entry.qualityConfidence).length;
   console.log(`[stage=render] candidate=${candidateIndex} status=done visionStatus=${visionStatus} qualityConfidence=${entry.qualityConfidenceScore.toFixed(2)} outputPath=${entry.url}`);
+
+  // AI on-screen hook generation — sits strictly AFTER rendering and analyzes the ACTUAL
+  // RENDERED clip, never the composition/layout decision itself. generateInitial() never
+  // throws (always resolves to a status object), so a slow/failed LLM call can only ever
+  // delay how soon a hook appears, never fail or block the clip finishing successfully.
+  entry.hook = await captionAi.generateInitial({ entry, cand, outputPath, tmpDir: clipTmp });
 
   fs.rm(clipTmp, { recursive: true, force: true }, () => {});
 }

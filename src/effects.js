@@ -2,6 +2,7 @@ const { validateFaceCrop } = require('./facedetect');
 const {
   OUT_W: DEFAULT_OUT_W, OUT_H: DEFAULT_OUT_H,
   evenify, cropBoxFor, cropBoxForRegion, FACE_CROP_MARGIN_STEPS, INSET_FACE_AR,
+  decideCropOrFit,
 } = require('./geometry');
 
 const MIN_SEGMENT = 1.0;
@@ -55,9 +56,16 @@ function pickBaseLayout(people, srcW, srcH, reactionComposite, outW = DEFAULT_OU
   if (reactionComposite?.isReactionComposite) {
     const threshold = MIN_COMPOSITE_CONFIDENCE[reactionComposite.source] ?? 0.5;
     if (reactionComposite.confidence >= threshold) {
-      return buildReactionLayout(people, srcW, srcH, reactionComposite);
+      return buildReactionLayout(people, srcW, srcH, reactionComposite, outW, outH);
     }
   }
+
+  // No face anywhere in this chunk (detectPeopleInWindow's "nothing found" fallback still
+  // hands back one fake centered slot so callers never have to null-check .slots, but
+  // faceCount stays 0 — that's the real signal). Guessing a face-shaped crop around a made-
+  // up point would be worse than doing nothing: per the fallback rule ("preserve more
+  // information, not zoom in more"), show the whole frame content-preserving instead.
+  if (people.faceCount === 0) return { type: 'fit' };
 
   const n = people.slots.length;
   if (n === 2) {
@@ -143,7 +151,7 @@ function contentRegionExcludingFacecam(rect) {
 // of one blind split/center-crop. Fails safe to {type:'fit'} whenever the geometry can't
 // confidently support a two-region crop (this must never be described as gameplay
 // saliency — it's a static exclusion, not content-aware tracking).
-function buildReactionLayout(people, srcW, srcH, reactionComposite) {
+function buildReactionLayout(people, srcW, srcH, reactionComposite, outW = DEFAULT_OUT_W, outH = DEFAULT_OUT_H) {
   const facecamBox = reactionComposite.facecamBox; // center-based {cx,cy,w,h}
   const facecamRectTopLeft = { x: facecamBox.cx - facecamBox.w / 2, y: facecamBox.cy - facecamBox.h / 2, w: facecamBox.w, h: facecamBox.h };
 
@@ -175,7 +183,42 @@ function buildReactionLayout(people, srcW, srcH, reactionComposite) {
   };
 
   const variant = facecamBox.w * facecamBox.h < FACECAM_AREA_INSET_THRESHOLD ? 'reaction-inset' : 'reaction-split';
-  return { type: variant, faceBox, contentBox };
+  // The content panel gets its OWN composition decision — see geometry.js:decideCropOrFit.
+  // reaction-split's content band is outW x (outH/2); reaction-inset's content background
+  // fills the whole outW x outH canvas (the face is a small overlay on top of it), so each
+  // variant judges the loss against the AR it will actually be rendered into.
+  const contentTargetAR = variant === 'reaction-inset' ? outW / outH : outW / evenify(outH / 2);
+  const contentFraming = decideCropOrFit(contentBox, srcW, srcH, contentTargetAR);
+  console.log(
+    `[stage=layout] reactionComposite content framing=${contentFraming.mode} ` +
+    `(retained=${(contentFraming.retainedFraction * 100).toFixed(0)}% of content region)`
+  );
+  return { type: variant, faceBox, contentBox, contentFraming };
+}
+
+// Builds a content-only layout (used for a full-screen content-beat cutaway, the manual
+// editor's "content" type, and any other case where ONLY the reacted-to content should
+// fill the whole outW x outH canvas — no separate reactor panel). Same crop-vs-fit
+// decision as buildReactionLayout's content half, just judged against the full canvas AR
+// instead of one band. This is what makes full-screen content its own composition instead
+// of reusing whatever crop math a face panel would use (spec: full-screen mode must not
+// just be "scale + center crop").
+function buildContentOnlyLayout(contentBox, srcW, srcH, outW = DEFAULT_OUT_W, outH = DEFAULT_OUT_H) {
+  const targetAR = outW / outH;
+  const framing = decideCropOrFit(contentBox, srcW, srcH, targetAR);
+  console.log(
+    `[stage=layout] content-only framing=${framing.mode} (retained=${(framing.retainedFraction * 100).toFixed(0)}%)`
+  );
+  // regionBounded tells render.js to crop WITHIN contentBox's own footprint (never growing
+  // past its edge into whatever this region deliberately excluded) instead of the generic
+  // manualCrop path, which grows outward — correct for a face nudge, wrong for content.
+  const layout = framing.mode === 'fit'
+    ? { type: 'fit', box: contentBox, contentFraming: framing }
+    : { type: 'single', slot: contentBox, manualCrop: contentBox, regionBounded: true, contentFraming: framing };
+  // contentBox never carries a landmarkBox, so this is a no-op today (content has no face
+  // to validate) — routed through anyway so every layout this module hands to render.js,
+  // with no exceptions, has passed through the one invariant gate.
+  return finalizeLayoutWithCropValidation(layout, srcW, srcH, outW, outH);
 }
 
 function landmarkCenterNorm(landmarkBox, srcW, srcH) {
@@ -463,7 +506,7 @@ function planClipSegments({ length, layoutTimeline, energy, hopSec, absStart, sr
           const cutStart = Math.max(seg.start, peak.localT - 0.9);
           const cutEnd = Math.min(seg.end, peak.localT + 0.9);
           if (cutStart - seg.start > MIN_SEGMENT && seg.end - cutEnd > MIN_SEGMENT) {
-            const contentLayout = finalizeLayoutWithCropValidation({ type: 'single', slot: run.layout.contentBox }, srcW, srcH, outW, outH);
+            const contentLayout = buildContentOnlyLayout(run.layout.contentBox, srcW, srcH, outW, outH);
             segments.splice(segIdx, 1,
               { start: seg.start, end: cutStart, rate: 1, layout: seg.layout },
               { start: cutStart, end: cutEnd, rate: 1, layout: contentLayout, tag: 'content-beat' },
@@ -577,7 +620,7 @@ function mapUserTypeToLayout(userType, timeRange, layoutTimeline, reactionCompos
 
   if (userType === 'split') {
     if (isComposite) {
-      layout = buildReactionLayout(people, srcW, srcH, reactionComposite);
+      layout = buildReactionLayout(people, srcW, srcH, reactionComposite, outW, outH);
       if (layout.faceBox) layout.faceBox = applyCropAdjust(layout.faceBox, cropAdjust?.face);
       if (layout.contentBox) layout.contentBox = applyCropAdjust(layout.contentBox, cropAdjust?.content);
     } else if (people.slots.length >= 2) {
@@ -585,7 +628,22 @@ function mapUserTypeToLayout(userType, timeRange, layoutTimeline, reactionCompos
     } else {
       layout = { type: 'fit' }; // nothing to split with — fail safe rather than guess
     }
-  } else if (userType === 'reactor' || userType === 'content' || userType === 'full') {
+  } else if (userType === 'content') {
+    // Full-screen content gets its own crop-vs-fit composition decision (buildContentOnlyLayout)
+    // instead of always being force-fit into a manual cover-crop — same reasoning as the
+    // auto-generated content-beat cutaway (pipeline.js) and reaction-split's content half.
+    let contentBox;
+    if (isComposite) {
+      const fb = reactionComposite.facecamBox;
+      const rectTL = { x: fb.cx - fb.w / 2, y: fb.cy - fb.h / 2, w: fb.w, h: fb.h };
+      const contentRect = contentRegionExcludingFacecam(rectTL);
+      contentBox = { cx: contentRect.x + contentRect.w / 2, cy: contentRect.y + contentRect.h / 2, w: contentRect.w, h: contentRect.h };
+    } else {
+      contentBox = { cx: 0.5, cy: 0.5, w: 0.9, h: 0.9 }; // no known content region — center fallback
+    }
+    contentBox = applyCropAdjust(contentBox, cropAdjust);
+    layout = buildContentOnlyLayout(contentBox, srcW, srcH, outW, outH);
+  } else if (userType === 'reactor' || userType === 'full') {
     let slot;
     if (userType === 'reactor') {
       if (people.slots.length) {
@@ -595,15 +653,6 @@ function mapUserTypeToLayout(userType, timeRange, layoutTimeline, reactionCompos
         slot = { cx: fb.cx, cy: fb.cy, w: fb.w / FALLBACK_FACE_SHRINK, h: fb.h / FALLBACK_FACE_SHRINK };
       } else {
         slot = { cx: 0.5, cy: 0.42, w: 0.3, h: 0.4 };
-      }
-    } else if (userType === 'content') {
-      if (isComposite) {
-        const fb = reactionComposite.facecamBox;
-        const rectTL = { x: fb.cx - fb.w / 2, y: fb.cy - fb.h / 2, w: fb.w, h: fb.h };
-        const contentRect = contentRegionExcludingFacecam(rectTL);
-        slot = { cx: contentRect.x + contentRect.w / 2, cy: contentRect.y + contentRect.h / 2, w: contentRect.w, h: contentRect.h };
-      } else {
-        slot = { cx: 0.5, cy: 0.5, w: 0.9, h: 0.9 }; // no known content region — center fallback
       }
     } else {
       // 'full' — one unified frame, not split, centered on whatever's actually there
@@ -619,7 +668,7 @@ function mapUserTypeToLayout(userType, timeRange, layoutTimeline, reactionCompos
       }
     }
     slot = applyCropAdjust(slot, cropAdjust);
-    layout = { type: 'single', slot, manualCrop: slot, manualCropMargin: userType === 'content' ? 0.05 : DEFAULT_MANUAL_CROP_MARGIN };
+    layout = { type: 'single', slot, manualCrop: slot, manualCropMargin: DEFAULT_MANUAL_CROP_MARGIN };
   } else {
     layout = { type: 'fit' };
   }
@@ -630,6 +679,6 @@ function mapUserTypeToLayout(userType, timeRange, layoutTimeline, reactionCompos
 module.exports = {
   planClipSegments, findDistinctPeak, pickBaseLayout, findDeadAirGaps, applyCutsToSegments,
   extractSegmentRange, buildLayoutSegments, pickPrimaryReactor, buildReactionLayout,
-  finalizeLayoutWithCropValidation, contentRegionExcludingFacecam,
+  finalizeLayoutWithCropValidation, contentRegionExcludingFacecam, buildContentOnlyLayout,
   applyCropAdjust, findBestChunk, computeUserTypeOptions, inferUserTypeFromLayout, mapUserTypeToLayout,
 };

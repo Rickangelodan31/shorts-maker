@@ -9,9 +9,10 @@ const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
 const multer = require('multer');
-const { runPipeline, renderMore, applyManualEdit, OUTPUT_DIR } = require('./src/pipeline');
+const { runPipeline, renderMore, applyManualEdit, OUTPUT_DIR, TMP_DIR } = require('./src/pipeline');
 const { computeUserTypeOptions, inferUserTypeFromLayout } = require('./src/effects');
 const { UPLOAD_DIR } = require('./src/ingest');
+const captionAi = require('./src/captionAi/generator');
 const auth = require('./src/auth');
 const youtube = require('./src/social/youtube');
 const tiktok = require('./src/social/tiktok');
@@ -254,6 +255,33 @@ function validateEditedSegments(segments, clipLength) {
   return null;
 }
 
+// Debug/visualization support (see spec: "build a debug mode so I can understand why the
+// AI made a framing decision"). Reports exactly the layout data the render actually used —
+// no re-computation, no guessing — so this can never drift from what was rendered.
+function debugInfoForSegment(seg) {
+  const l = seg.layout || {};
+  const info = { layoutType: l.type || null };
+  if (l.type === 'single') {
+    info.crop = l.slot ? { cx: l.slot.cx, cy: l.slot.cy, w: l.slot.w ?? null, h: l.slot.h ?? null } : null;
+    info.manual = !!l.manualCrop;
+  } else if (l.type === 'split') {
+    info.slots = (l.slots || []).map((s) => ({ cx: s.cx, cy: s.cy }));
+  } else if (l.type === 'reaction-split' || l.type === 'reaction-inset') {
+    info.faceBox = l.faceBox ? { cx: l.faceBox.cx, cy: l.faceBox.cy, w: l.faceBox.w, h: l.faceBox.h } : null;
+    info.faceMargin = l.faceMargin ?? null;
+    info.contentBox = l.contentBox ? { cx: l.contentBox.cx, cy: l.contentBox.cy, w: l.contentBox.w, h: l.contentBox.h } : null;
+  } else if (l.type === 'fit') {
+    info.box = l.box ? { cx: l.box.cx, cy: l.box.cy, w: l.box.w, h: l.box.h } : null; // null box = whole frame
+  }
+  if (l.contentFraming) {
+    info.contentFraming = {
+      mode: l.contentFraming.mode,
+      retainedPct: Math.round(l.contentFraming.retainedFraction * 100),
+    };
+  }
+  return info;
+}
+
 app.get('/api/jobs/:id/clips/:index/timeline', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
@@ -261,9 +289,18 @@ app.get('/api/jobs/:id/clips/:index/timeline', (req, res) => {
   const entry = job.results?.find((r) => r.candidateIndex === index);
   const cand = job.candidates?.[index];
   if (!entry || !cand || entry.status !== 'done') return res.status(404).json({ error: 'Clip not found or not ready' });
-  const segments = (entry.segments || []).map((s) => ({ start: s.start, end: s.end, userType: inferUserTypeFromLayout(s) }));
+  const segments = (entry.segments || []).map((s) => ({
+    start: s.start, end: s.end, userType: inferUserTypeFromLayout(s), debug: debugInfoForSegment(s),
+  }));
   const userTypeOptions = computeUserTypeOptions(cand.layoutTimeline, cand.resolvedReactionComposite);
-  res.json({ segments, userTypeOptions, clipLength: entry.length });
+  const reactionComposite = cand.resolvedReactionComposite
+    ? {
+      isReactionComposite: cand.resolvedReactionComposite.isReactionComposite,
+      confidence: cand.resolvedReactionComposite.confidence,
+      source: cand.resolvedReactionComposite.source,
+    }
+    : null;
+  res.json({ segments, userTypeOptions, clipLength: entry.length, reactionComposite });
 });
 
 app.post('/api/jobs/:id/clips/:index/timeline', (req, res) => {
@@ -301,6 +338,85 @@ function ah(fn) {
     res.status(400).json({ error: err.message });
   });
 }
+
+// --- AI on-screen hook/caption generator (src/captionAi/*) ---
+// Sits strictly AFTER video generation (the initial hook is generated automatically inside
+// pipeline.js:renderOneClip once a clip is done) and never touches the composition/render
+// pipeline. These two routes only ever read/write entry.hook on the same in-memory
+// job/candidate the manual-editor timeline routes above already use.
+function findClipForCaptions(jobId, candidateIndex) {
+  const job = jobs.get(jobId);
+  if (!job) return { error: 'Job not found' };
+  const entry = job.results?.find((r) => r.candidateIndex === candidateIndex);
+  const cand = job.candidates?.[candidateIndex];
+  if (!entry || !cand || entry.status !== 'done') return { error: 'Clip not found or not ready' };
+  return { job, entry, cand };
+}
+
+const EMPTY_HOOK = { status: 'ready', primary: null, alternatives: [], analysis: null, selectedText: null };
+
+app.post('/api/captions/generate', ah(async (req, res) => {
+  const { videoId, candidateIndex, action, style, userCaption } = req.body || {};
+  const index = parseInt(candidateIndex, 10);
+  if (!videoId || Number.isNaN(index)) return res.status(400).json({ error: 'videoId and candidateIndex are required' });
+  const { entry, cand, error } = findClipForCaptions(videoId, index);
+  if (error) return res.status(404).json({ error });
+
+  const analysis = entry.hook?.analysis || null;
+  const priorTexts = [entry.hook?.primary?.text, ...(entry.hook?.alternatives || []).map((a) => a.text)].filter(Boolean);
+
+  // "retry" re-runs the FULL initial (vision) analysis — used by the "AI caption
+  // unavailable -> Try Again" UI when there was never a usable analysis to build on.
+  if (action === 'retry') {
+    const fileName = `short_${index}.mp4`;
+    const outputPath = path.join(OUTPUT_DIR, videoId, fileName);
+    const tmpDir = path.join(TMP_DIR, videoId, `hookretry_${index}_${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    try {
+      entry.hook = await captionAi.generateInitial({ entry, cand, outputPath, tmpDir });
+    } finally {
+      fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+    }
+    return res.json(entry.hook);
+  }
+
+  let result;
+  if (action === 'improve') {
+    if (!userCaption || !userCaption.trim()) return res.status(400).json({ error: 'userCaption is required for action=improve' });
+    result = await captionAi.improveCaption({ entry, cand, analysis, userCaption, excludeTexts: priorTexts });
+  } else if (action === 'more') {
+    result = await captionAi.generateMore({ entry, cand, analysis, style, excludeTexts: priorTexts });
+  } else {
+    return res.status(400).json({ error: 'action must be "more", "improve", or "retry"' });
+  }
+
+  if (result.status === 'unavailable') return res.json({ status: 'unavailable', alternatives: [] });
+  if (result.status !== 'ready') return res.json({ status: 'error', alternatives: [] });
+
+  // Merge fresh alternatives into the persisted hook state — never touches the primary or
+  // any already-shown alternative, so re-opening the clip later still shows every option
+  // that was ever generated for it (the caching requirement: no AI call on a plain reopen).
+  entry.hook = entry.hook || { ...EMPTY_HOOK };
+  entry.hook.alternatives = [...(entry.hook.alternatives || []), ...result.alternatives];
+  entry.hook.status = 'ready';
+  res.json({ status: 'ready', alternatives: result.alternatives, hook: entry.hook });
+}));
+
+// Records the user's final choice (a generated option as-is, or hand-edited text) — no AI
+// call, just persistence, exactly like the caching requirement asks for.
+app.post('/api/captions/select', (req, res) => {
+  const { videoId, candidateIndex, text, style } = req.body || {};
+  const index = parseInt(candidateIndex, 10);
+  if (!videoId || Number.isNaN(index) || typeof text !== 'string') {
+    return res.status(400).json({ error: 'videoId, candidateIndex and text are required' });
+  }
+  const { entry, error } = findClipForCaptions(videoId, index);
+  if (error) return res.status(404).json({ error });
+  entry.hook = entry.hook || { ...EMPTY_HOOK };
+  entry.hook.selectedText = text.trim();
+  if (style) entry.hook.selectedStyle = style;
+  res.json({ ok: true, hook: entry.hook });
+});
 
 app.get('/api/cartoon/styles', (req, res) => res.json({ presets: cartoonStyle.listPresets() }));
 

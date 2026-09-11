@@ -122,6 +122,185 @@ function peopleNote(faceCount, layoutSwitches) {
   return layoutSwitches > 0 ? `${base} (switches ${layoutSwitches}x)` : base;
 }
 
+// --- AI on-screen hook/caption generator ---
+// Renders from entry.hook (see server.js POST /api/captions/generate and
+// src/captionAi/*) — a NEW feature that runs after rendering; it never affects the video
+// pixels or the composition/layout editor above it on the card.
+const STYLE_META = {
+  curiosity: { label: 'Curiosity', emoji: '👀' },
+  shock: { label: 'Shock', emoji: '😳' },
+  controversial: { label: 'Controversial', emoji: '💀' },
+  funny: { label: 'Funny', emoji: '😂' },
+  reaction: { label: 'Reaction', emoji: '😭' },
+  story: { label: 'Story / Context', emoji: '' },
+  punchy: { label: 'Short / Punchy', emoji: '💀' },
+  question: { label: 'Question', emoji: '👀' },
+};
+
+function hookCard(item, { primary = false } = {}) {
+  const meta = STYLE_META[item.style] || { label: item.style, emoji: '' };
+  const card = document.createElement('div');
+  card.className = primary ? 'hook-card hook-card-primary' : 'hook-card';
+  card.innerHTML = `
+    <div class="hook-card-style">${primary ? '🔥 AI RECOMMENDED' : `${meta.emoji} ${meta.label}`}</div>
+    <div class="hook-card-text" contenteditable="true" spellcheck="false"></div>
+    <div class="hook-card-actions">
+      <button type="button" class="hook-use-btn">Use</button>
+      <button type="button" class="hook-copy-btn">Copy</button>
+    </div>
+  `;
+  // Set as a DOM property, not embedded in the template string above, so AI-generated text
+  // can't break out of the HTML regardless of what characters it contains.
+  card.querySelector('.hook-card-text').textContent = item.text;
+  return card;
+}
+
+function buildHookSection(entry, jobId) {
+  const wrap = document.createElement('div');
+  wrap.className = 'hook-section';
+
+  if (entry.hook === undefined) {
+    wrap.innerHTML = '<div class="hook-header">AI CAPTION</div><p class="hint">Analyzing the clip for a hook...</p>';
+    return wrap;
+  }
+
+  const hook = entry.hook;
+  if (hook.status === 'unavailable') {
+    wrap.innerHTML = '<div class="hook-header">AI CAPTION</div><p class="hint">AI captions aren\'t configured for this app right now.</p>';
+    return wrap;
+  }
+
+  wrap.innerHTML = '<div class="hook-header">AI CAPTION</div>';
+  const body = document.createElement('div');
+  wrap.appendChild(body);
+
+  function useThisText(text, style) {
+    fetch('/api/captions/select', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ videoId: jobId, candidateIndex: entry.candidateIndex, text, style }),
+    }).then(() => { hook.selectedText = text; refresh(); }).catch(() => {});
+  }
+
+  function wireCard(card, item) {
+    const textEl = card.querySelector('.hook-card-text');
+    card.querySelector('.hook-use-btn').addEventListener('click', () => useThisText(textEl.textContent, item.style));
+    card.querySelector('.hook-copy-btn').addEventListener('click', () => {
+      navigator.clipboard?.writeText(textEl.textContent).catch(() => {});
+    });
+    if (hook.selectedText && hook.selectedText === item.text) card.classList.add('hook-card-selected');
+  }
+
+  function refresh() {
+    body.innerHTML = '';
+
+    if (hook.status === 'error' && !hook.primary && !hook.alternatives.length) {
+      const errBox = document.createElement('div');
+      errBox.className = 'hook-error';
+      errBox.innerHTML = '<p class="hint">AI caption generation failed.</p>';
+      const retryBtn = document.createElement('button');
+      retryBtn.type = 'button';
+      retryBtn.textContent = 'Try Again';
+      retryBtn.addEventListener('click', async () => {
+        retryBtn.disabled = true;
+        retryBtn.textContent = 'Retrying...';
+        try {
+          const res = await fetch('/api/captions/generate', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ videoId: jobId, candidateIndex: entry.candidateIndex, action: 'retry' }),
+          });
+          Object.assign(hook, await res.json());
+        } finally {
+          refresh();
+        }
+      });
+      errBox.appendChild(retryBtn);
+      body.appendChild(errBox);
+      return;
+    }
+
+    if (hook.primary) {
+      const primaryCard = hookCard(hook.primary, { primary: true });
+      wireCard(primaryCard, hook.primary);
+      body.appendChild(primaryCard);
+    }
+
+    if (hook.alternatives && hook.alternatives.length) {
+      const moreLabel = document.createElement('div');
+      moreLabel.className = 'hook-more-label';
+      moreLabel.textContent = 'MORE OPTIONS';
+      body.appendChild(moreLabel);
+      const altWrap = document.createElement('div');
+      altWrap.className = 'hook-alt-list';
+      hook.alternatives.forEach((item) => {
+        const card = hookCard(item);
+        wireCard(card, item);
+        altWrap.appendChild(card);
+      });
+      body.appendChild(altWrap);
+    }
+
+    const controls = document.createElement('div');
+    controls.className = 'hook-controls';
+    controls.innerHTML = `
+      <div class="hook-generate-row">
+        <select class="hook-style-select">
+          <option value="">Auto</option>
+          ${Object.entries(STYLE_META).map(([k, m]) => `<option value="${k}">${m.label}</option>`).join('')}
+        </select>
+        <button type="button" class="hook-more-btn">Generate More</button>
+      </div>
+      <div class="hook-own-row">
+        <textarea class="hook-own-input" rows="2" placeholder="Write your own caption..."></textarea>
+        <button type="button" class="hook-improve-btn">✨ Generate Better Versions</button>
+      </div>
+    `;
+    body.appendChild(controls);
+
+    const moreBtn = controls.querySelector('.hook-more-btn');
+    moreBtn.addEventListener('click', async () => {
+      moreBtn.disabled = true;
+      moreBtn.textContent = 'Generating...';
+      try {
+        const style = controls.querySelector('.hook-style-select').value;
+        const res = await fetch('/api/captions/generate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ videoId: jobId, candidateIndex: entry.candidateIndex, action: 'more', style: style || undefined }),
+        });
+        const data = await res.json();
+        if (data.status === 'ready' && data.hook) Object.assign(hook, data.hook);
+      } finally {
+        moreBtn.disabled = false;
+        moreBtn.textContent = 'Generate More';
+        refresh();
+      }
+    });
+
+    const improveBtn = controls.querySelector('.hook-improve-btn');
+    improveBtn.addEventListener('click', async () => {
+      const own = controls.querySelector('.hook-own-input').value.trim();
+      if (!own) return;
+      improveBtn.disabled = true;
+      improveBtn.textContent = 'Generating...';
+      try {
+        const res = await fetch('/api/captions/generate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ videoId: jobId, candidateIndex: entry.candidateIndex, action: 'improve', userCaption: own }),
+        });
+        const data = await res.json();
+        if (data.status === 'ready' && data.hook) Object.assign(hook, data.hook);
+        else if (data.status === 'unavailable') alert('AI captions aren\'t configured for this app right now.');
+      } finally {
+        improveBtn.disabled = false;
+        improveBtn.textContent = '✨ Generate Better Versions';
+        refresh();
+      }
+    });
+  }
+
+  refresh();
+  return wrap;
+}
+
 async function postToSocial(clipUrl, platform, caption, btn) {
   btn.disabled = true;
   const original = btn.textContent;
@@ -187,6 +366,7 @@ function renderCard(entry, jobId) {
     const panel = div.querySelector('.editor-panel');
     const video = div.querySelector('video');
     editBtn.addEventListener('click', () => toggleEditor(jobId, entry, panel, video, editBtn));
+    div.appendChild(buildHookSection(entry, jobId));
     return div;
   }
   if (entry.status === 'error') {
@@ -256,7 +436,13 @@ async function pollJob(jobId, opts = {}) {
     renderResults(job);
   }
 
-  const stillWorking = !job.results?.length || job.results.some((e) => e.status !== 'done' && e.status !== 'error');
+  // A 'done' clip's AI hook (see buildHookSection) finishes generating slightly AFTER the
+  // clip itself is marked done (pipeline.js runs it as a trailing step) — entry.hook stays
+  // undefined in between. Keep polling through that window too, or the UI would stop
+  // refreshing right before the hook actually arrives.
+  const stillWorking = !job.results?.length || job.results.some((e) => (
+    (e.status !== 'done' && e.status !== 'error') || (e.status === 'done' && e.hook === undefined)
+  ));
   const overallActive = job.status === 'downloading' || job.status === 'analyzing' || (job.status === 'rendering' && stillWorking);
 
   if (overallActive && (!job.results || !job.results.length)) {
@@ -357,6 +543,7 @@ async function toggleEditor(jobId, entry, panel, video, editBtn) {
     const state = {
       jobId, index: entry.candidateIndex, clipLength: data.clipLength,
       segments: data.segments.map((s) => ({ ...s })), userTypeOptions: data.userTypeOptions,
+      reactionComposite: data.reactionComposite || null,
       selectedIdx: null,
     };
     buildEditorUI(state, panel, video, editBtn);
@@ -403,6 +590,46 @@ function buildNudgePad(seg, key, label, onChange) {
     pad.appendChild(b);
   });
   wrap.appendChild(pad);
+  return wrap;
+}
+
+const LAYOUT_TYPE_LABELS = {
+  single: 'Single crop', split: 'Split screen', 'reaction-split': 'Reaction split (2 panels)',
+  'reaction-inset': 'Reaction inset (PiP)', fit: 'Content-preserving fit (letterboxed)',
+};
+
+// "Why did it frame it this way?" panel — surfaces exactly the layout data the render
+// actually used (see server.js:debugInfoForSegment), so a human can see the composition
+// engine's real decision instead of guessing from the output video alone.
+function buildDebugPanel(seg, state) {
+  const wrap = document.createElement('details');
+  wrap.className = 'debug-panel';
+  const d = seg.debug || {};
+  const lines = [];
+  lines.push(`<div><b>Layout:</b> ${LAYOUT_TYPE_LABELS[d.layoutType] || d.layoutType || '—'}</div>`);
+  if (d.contentFraming) {
+    const modeLabel = d.contentFraming.mode === 'fit' ? 'Preserved (fit + blur)' : 'Cropped';
+    lines.push(`<div><b>Content framing:</b> ${modeLabel} — ${d.contentFraming.retainedPct}% of the content region kept</div>`);
+  }
+  if (d.faceBox) {
+    lines.push(`<div><b>Face box:</b> center (${d.faceBox.cx.toFixed(2)}, ${d.faceBox.cy.toFixed(2)}), margin ${d.faceMargin ?? '—'}</div>`);
+  }
+  if (d.contentBox) {
+    lines.push(`<div><b>Content box:</b> center (${d.contentBox.cx.toFixed(2)}, ${d.contentBox.cy.toFixed(2)}), size ${(d.contentBox.w * 100).toFixed(0)}%×${(d.contentBox.h * 100).toFixed(0)}%</div>`);
+  }
+  if (d.crop) {
+    lines.push(`<div><b>Crop center:</b> (${d.crop.cx.toFixed(2)}, ${d.crop.cy.toFixed(2)})${d.manual ? ' (manual)' : ''}</div>`);
+  }
+  if (d.box) {
+    lines.push(`<div><b>Preserved region:</b> center (${d.box.cx.toFixed(2)}, ${d.box.cy.toFixed(2)}), size ${(d.box.w * 100).toFixed(0)}%×${(d.box.h * 100).toFixed(0)}%</div>`);
+  } else if (d.layoutType === 'fit') {
+    lines.push('<div><b>Preserved region:</b> whole frame</div>');
+  }
+  const rc = state.reactionComposite;
+  if (rc?.isReactionComposite) {
+    lines.push(`<div><b>Reaction-composite detection:</b> confidence ${(rc.confidence * 100).toFixed(0)}% (${rc.source})</div>`);
+  }
+  wrap.innerHTML = `<summary>Why this framing?</summary><div class="debug-panel-body">${lines.join('')}</div>`;
   return wrap;
 }
 
@@ -518,6 +745,8 @@ function buildEditorUI(state, panel, video, editBtn) {
       }
       groups.forEach(([key, label]) => inspector.appendChild(buildNudgePad(seg, key, label, refresh)));
     }
+
+    inspector.appendChild(buildDebugPanel(seg, state));
   }
 
   refresh();

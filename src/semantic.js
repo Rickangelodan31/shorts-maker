@@ -228,12 +228,17 @@ describe topic/visual content only.
    moment beats the chronological opening, set use_cold_open=false and use -1 for
    hook_start_sec/hook_end_sec.
 
-2. REACTION COMPOSITE: determine whether this footage is a facecam-reaction-over-content
-   composite (one person's face, likely in a fixed corner/edge position, overlaid on
-   separate content like gameplay/video/screen recording, all within ONE video frame).
-   If so, set is_reaction_composite=true and give the facecam's approximate bounding box
-   as fractions of frame width/height, TOP-LEFT origin (facecam_x, facecam_y, facecam_w,
-   facecam_h, each 0..1) and a confidence (0..1). If not applicable, set
+2. REACTION COMPOSITE: determine whether this single video frame shows a person reacting
+   to separate content sharing the SAME frame with them, in EITHER of two arrangements:
+   (a) a small facecam overlay, usually in a fixed corner/edge position, on top of content
+   like gameplay/video/screen recording; or (b) a genuine side-by-side split where the
+   reactor occupies roughly half the frame (left/right or top/bottom) next to separate
+   content occupying the other half. Both count as is_reaction_composite=true. Give the
+   REACTOR's own bounding box (not the content's) as fractions of frame width/height,
+   TOP-LEFT origin (facecam_x, facecam_y, facecam_w, facecam_h, each 0..1) — for a
+   side-by-side split this box should span roughly the reactor's whole half of the frame,
+   not just their face — and a confidence (0..1). If neither arrangement applies (e.g. the
+   reactor's own single camera fills the whole frame, or there is no reactor at all), set
    is_reaction_composite=false and use -1 for facecam_x/y/w/h and 0 for facecam_confidence.
 
 3. RENDERABILITY: decide whether this window is actually usable as a short-form clip.

@@ -484,6 +484,11 @@ main {
 .nudge-label { font-size: 0.75rem; color: var(--muted); margin-bottom: 4px; }
 .nudge-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; max-width: 180px; }
 
+.debug-panel { margin-top: 12px; font-size: 0.78rem; color: var(--muted); }
+.debug-panel summary { cursor: pointer; color: var(--accent); user-select: none; }
+.debug-panel-body { margin-top: 6px; display: grid; gap: 3px; }
+.debug-panel-body b { color: inherit; font-weight: 600; }
+
 .editor-actions {
   display: flex;
   justify-content: flex-end;
@@ -774,3 +779,109 @@ main {
   background: #000;
   margin-bottom: 8px;
 }
+
+/* --- AI on-screen hook/caption generator --- */
+.hook-section {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.hook-header {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.hook-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.hook-card-primary {
+  border-color: var(--accent);
+  background: linear-gradient(160deg, rgba(124, 92, 255, 0.14), rgba(255, 92, 168, 0.08));
+}
+.hook-card-selected { border-color: var(--accent-2); }
+.hook-card-style {
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-bottom: 4px;
+  letter-spacing: 0.03em;
+}
+.hook-card-primary .hook-card-style { color: var(--accent); font-weight: 700; }
+.hook-card-text {
+  font-size: 0.95rem;
+  line-height: 1.35;
+  outline: none;
+  padding: 2px 0;
+}
+.hook-card-text:focus { text-decoration: underline dotted var(--muted); }
+.hook-card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.hook-card-actions button {
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.hook-card-actions button:hover { border-color: var(--accent); }
+.hook-more-label {
+  font-size: 0.7rem;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+  margin: 10px 0 6px;
+}
+.hook-alt-list { display: grid; gap: 6px; }
+.hook-controls { margin-top: 12px; display: grid; gap: 8px; }
+.hook-generate-row { display: flex; gap: 8px; }
+.hook-style-select {
+  flex: 0 0 auto;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 0.8rem;
+}
+.hook-more-btn, .hook-improve-btn {
+  flex: 1;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.hook-more-btn:hover, .hook-improve-btn:hover { border-color: var(--accent); }
+.hook-own-row { display: grid; gap: 6px; }
+.hook-own-input {
+  width: 100%;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 0.85rem;
+  resize: vertical;
+  font-family: inherit;
+}
+.hook-error button {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.hook-error button:hover { border-color: var(--accent); }
