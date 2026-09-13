@@ -13,6 +13,7 @@ const { planClipSegments, mapUserTypeToLayout } = require('./effects');
 const { buildCaptionsAss } = require('./captions');
 const { probeUrlMeta, downloadAudioOnly, downloadSection } = require('./ingest');
 const captionAi = require('./captionAi/generator');
+const critic = require('./critic');
 
 const OUTPUT_DIR = path.join(__dirname, '..', 'output');
 const TMP_DIR = path.join(__dirname, '..', 'tmp');
@@ -23,10 +24,139 @@ const CANDIDATE_POOL = 20;
 // (further trimmed again in candidates.js's semantic-pass selection).
 const VISUAL_CANDIDATE_POOL = 10;
 const CONCURRENCY = Math.max(1, Math.min(4, os.cpus().length - 1));
+// Plan doc M7 — denser face-detection keyframes (down from the original 12s), applied ONLY
+// here in renderOneClip — i.e. only for a candidate that has already passed vision-veto and
+// is actually about to render, never during the cheap selection-scan phase (which never
+// calls detectLayoutTimeline at all). This is what buildKeyframesForRun (effects.js) needs
+// to have enough distinct chunks per merged run to pan smoothly instead of falling back to
+// today's static-per-run crop.
+const LAYOUT_CHUNK_SEC = parseFloat(process.env.LAYOUT_CHUNK_SEC || '6');
 // Vision calls are network-bound (not CPU-bound), so a slightly higher bound than render
 // concurrency is safe here, but still capped so we don't hammer the API or spawn unbounded
 // ffmpeg frame-extraction processes at once.
 const VISION_CONCURRENCY = Math.max(1, Math.min(4, parseInt(process.env.SEMANTIC_VISION_CONCURRENCY || '3', 10)));
+// Secondary reordering weight for Stage 2's emotionalImportance signal (see the promotion
+// loop below) — deliberately small; a nudge/tiebreaker among already-vision-checked
+// candidates, not a re-ranking engine.
+const CUT_SCORE_WEIGHT_VISUAL_IMPORTANCE = parseFloat(process.env.CUT_SCORE_WEIGHT_VISUAL_IMPORTANCE || '0.06');
+
+// Plan doc M2 — an OPT-IN minimum-quality floor for the final promotion loop below. `null`
+// (the default) disables it entirely, which reproduces today's exact selection-count
+// behavior (fill to autoCount from promotionOrder, including unchecked/unvetoed candidates
+// near the tail, exactly as before). Evaluated ONLY against `candidate.cutScore` — the
+// pre-existing baseline signal, already inclusive of M1's momentSignalBonus when available —
+// never against momentSignals directly, so a candidate can never be independently rejected
+// merely because M1's LLM signal was missing or partial.
+const MIN_CLIP_QUALITY_FLOOR = process.env.MIN_CLIP_QUALITY_FLOOR != null && process.env.MIN_CLIP_QUALITY_FLOOR !== ''
+  ? parseFloat(process.env.MIN_CLIP_QUALITY_FLOOR)
+  : null;
+
+// `floor` defaults to the env-configured constant above — the promotion loop's real call
+// site (`passesQualityFloor(cand)`) always uses that default. The explicit second parameter
+// exists purely so tests can exercise the "floor enabled" branch deterministically without
+// needing to set an env var before this module is first required.
+function passesQualityFloor(candidate, floor = MIN_CLIP_QUALITY_FLOOR) {
+  if (floor == null) return true;
+  return candidate.cutScore >= floor;
+}
+
+// Plan doc M2 — a lightweight editorial category derived ONLY from signals that already
+// exist (M1's momentSignals when available, else the pre-existing semanticEvent emotion
+// fields) — never a new classification pass. Used only to diversify PROMOTION ORDER among
+// candidates that have already survived time-overlap dedup (semantic.dedupeByOverlap, applied
+// upstream in runPipeline before job.candidates is ever built) — it cannot resurrect or admit
+// an overlapping candidate, only reorder which of the already-distinct ones goes first.
+const MOMENT_CATEGORY_DIMENSIONS = [
+  { key: 'humor', category: 'funniest' },
+  { key: 'surprise', category: 'surprising' },
+  { key: 'payoff_strength', category: 'strongest story' },
+  { key: 'controversy', category: 'controversial' },
+  { key: 'hook_strength', category: 'strongest hook' },
+  { key: 'quotability', category: 'quotable' },
+];
+const MOMENT_CATEGORY_MIN_SIGNAL = parseFloat(process.env.MOMENT_CATEGORY_MIN_SIGNAL || '0.6');
+const EMOTION_FALLBACK_CATEGORY = { joy: 'funny/joyful', surprise: 'surprising', anger: 'intense', sadness: 'emotional', fear: 'intense', disgust: 'intense' };
+
+function deriveMomentCategory(candidate) {
+  const signals = candidate.momentSignals;
+  let best = null;
+  if (signals) {
+    for (const { key, category } of MOMENT_CATEGORY_DIMENSIONS) {
+      const v = signals[key];
+      if (typeof v === 'number' && Number.isFinite(v) && v >= MOMENT_CATEGORY_MIN_SIGNAL && (!best || v > best.value)) {
+        best = { category, value: v };
+      }
+    }
+  }
+  if (best) return best.category;
+  const emotion = candidate.semanticEvent?.primary_emotion;
+  const intensity = candidate.semanticEvent?.emotion_intensity || 0;
+  if (emotion && emotion !== 'neutral' && intensity >= 0.5) return EMOTION_FALLBACK_CATEGORY[emotion] || 'emotional';
+  return 'general';
+}
+
+// Reorders `promotionOrder` (a permutation of job.candidates indices — never adds or removes
+// an entry) so the single best-remaining candidate from each distinct category is promoted
+// before a second candidate from an already-represented category. Round-robins across
+// categories in the order their best candidate first appears in promotionOrder (i.e.
+// category "priority" falls straight out of the existing cutScore-based order — no separate
+// category ranking is invented). When every candidate falls into ONE category (the universal
+// case until M1's LLM signal is available), this degenerates to a single round-robin "round"
+// per candidate in original order — i.e. it is a stable no-op, provably identical to
+// `promotionOrder` unchanged.
+function buildDiverseOrder(candidates, promotionOrder) {
+  const byCategory = new Map();
+  for (const poolIndex of promotionOrder) {
+    const category = deriveMomentCategory(candidates[poolIndex]);
+    if (!byCategory.has(category)) byCategory.set(category, []);
+    byCategory.get(category).push(poolIndex);
+  }
+  const categoryOrder = [...byCategory.keys()];
+  const cursors = new Map(categoryOrder.map((c) => [c, 0]));
+  const result = [];
+  let remaining = promotionOrder.length;
+  while (remaining > 0) {
+    for (const category of categoryOrder) {
+      const list = byCategory.get(category);
+      const cursor = cursors.get(category);
+      if (cursor < list.length) {
+        result.push(list[cursor]);
+        cursors.set(category, cursor + 1);
+        remaining--;
+      }
+    }
+  }
+  return result;
+}
+
+// Plan doc M5 — safety bound on how many extra renders a run of critic rejections can trigger
+// in one job. Backfill is otherwise naturally bounded by the candidate pool, but a
+// pathologically bad source video (everything genuinely gets rejected) must not silently
+// balloon into rendering far more clips than requested — better to honestly return fewer
+// clips (same philosophy as M2's quality floor) than to keep paying for renders forever.
+const MAX_CRITIC_BACKFILL_ATTEMPTS = parseInt(process.env.MAX_CRITIC_BACKFILL_ATTEMPTS || String(AUTO_CLIP_COUNT), 10);
+
+// The actual bookkeeping for one critic verdict, separated from the render/critic I/O calls
+// so it's directly testable. On 'reject': deletes the rendered artifact and removes `entry`
+// from `job.results` SYNCHRONOUSLY (no `await` between the decision and the removal) — since
+// Node is single-threaded, no other code (an HTTP handler reading job.results, a concurrent
+// mapLimit worker) can ever observe `entry` sitting in job.results with a rejected verdict;
+// there is structurally nothing left for a consumer to render. `verdict` absent (critic
+// unavailable/failed) or `verdict.verdict === 'pass'` NEVER triggers this path — only an
+// explicit 'reject' does. Returns true iff a backfill slot was opened.
+function applyCriticVerdict(job, entry, verdict, outputDir = OUTPUT_DIR) {
+  if (!verdict) return false;
+  if (verdict.verdict !== 'reject') {
+    entry.criticVerdict = verdict;
+    return false;
+  }
+  console.log(`[stage=critic] candidate=${entry.candidateIndex} REJECTED reasons=${JSON.stringify(verdict.reasons || [])} confidence=${verdict.confidence}`);
+  const idx = job.results.indexOf(entry);
+  if (idx >= 0) job.results.splice(idx, 1);
+  const outputPath = path.join(outputDir, job.id, `short_${entry.candidateIndex}.mp4`);
+  fs.rm(outputPath, () => {});
+  return true;
+}
 
 // Simple counting semaphore. Unlike `mapLimit` (which only bounds concurrency WITHIN one
 // call), an instance of this held at module scope is shared across every job this process
@@ -223,13 +353,6 @@ async function renderOneClip(job, ctx, entry, candidateIndex) {
     console.log(`[stage=layout] candidate=${candidateIndex} reactionComposite(${reactionComposite.source})=${reactionComposite.isReactionComposite} confidence=${reactionComposite.confidence.toFixed(2)}`);
   }
 
-  entry.status = 'finding faces';
-  const layoutTimeline = await detectLayoutTimeline(sourceForRender, detectBase, win.length, clipTmp, widthForCrop, heightForCrop, 12, reactionComposite);
-  // Persisted (not just used once) so the manual editor can later reconstruct an alternate
-  // layout for a user-chosen time range/type without re-running face detection.
-  cand.layoutTimeline = layoutTimeline;
-  cand.resolvedReactionComposite = reactionComposite;
-
   const localWords = ctx.words
     .filter((w) => w.start >= win.start - 0.2 && w.end <= win.start + win.length + 0.2)
     .map((w) => ({
@@ -238,8 +361,32 @@ async function renderOneClip(job, ctx, entry, candidateIndex) {
       text: w.text,
     }));
   // Persisted (not just used once) so the AI hook generator can reuse this transcript after
-  // render without re-deriving it — see src/captionAi/analyzer.js.
+  // render without re-deriving it — see src/captionAi/analyzer.js. Computed BEFORE
+  // detectLayoutTimeline (moved up from its original position after that call, a safe
+  // reorder — nothing here depends on layoutTimeline) so it can be threaded into face
+  // detection for the speakingScore signal — see facedetect.js Component 5.
   cand.localWords = localWords;
+
+  entry.status = 'finding faces';
+  const layoutTimeline = await detectLayoutTimeline(sourceForRender, detectBase, win.length, clipTmp, widthForCrop, heightForCrop, LAYOUT_CHUNK_SEC, reactionComposite, localWords);
+  // Persisted (not just used once) so the manual editor can later reconstruct an alternate
+  // layout for a user-chosen time range/type without re-running face detection.
+  cand.layoutTimeline = layoutTimeline;
+  cand.resolvedReactionComposite = reactionComposite;
+
+  // Plan doc M4 — the full per-candidate reaction timeline, flattened from data
+  // detectLayoutTimeline already computed (expressiveMoments per chunk) and previously just
+  // discarded once planClipSegments picked its single best. Persisted for inspection/future
+  // consumers (e.g. a manual-editor UI) — planClipSegments itself still derives its own
+  // candidate list internally from layoutTimeline, so this is observability, not a second
+  // source of truth it reads from.
+  cand.reactionTimeline = layoutTimeline.flatMap((c) =>
+    (c.people.expressiveMoments || []).map((mo) => ({
+      clipLocalT: Math.round((c.start + mo.localT) * 100) / 100,
+      score: mo.score,
+      clusterIndex: mo.clusterIndex,
+    }))
+  );
 
   let hookSplice = null;
   const hook = cand.visionReport?.hook;
@@ -255,6 +402,10 @@ async function renderOneClip(job, ctx, entry, candidateIndex) {
     srcW: widthForCrop, srcH: heightForCrop,
     words: localWords, tightenPacing: !!job.options.tightenPacing,
     hookSplice, reactionComposite, outW, outH,
+    emotionalImportance: cand.visionReport?.emotionalImportance,
+    preferredFraming: cand.momentSignals?.preferred_framing || null,
+    narrativeBeats: ctx.narrativeBeats || [],
+    momentSignals: cand.momentSignals || null,
   });
   job.timings && (job.timings.framingMs += Date.now() - framingT0);
 
@@ -378,6 +529,12 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     const transcript = await transcribeIfAvailable(wavPath);
     ctx.words = transcript?.words || [];
 
+    // ONE whole-transcript narrative-arc call per video (not per-candidate) — kicked off
+    // now and run CONCURRENTLY with the candidate-generation block below (which does no LLM
+    // calls), then awaited just before rankCandidatesSemantic needs it, so it adds close to
+    // zero wall-clock latency in the common case. See semantic.js:analyzeNarrativeArc.
+    const narrativePromise = semantic.analyzeNarrativeArc(ctx.words, ctx.info.duration);
+
     const candidateGenT0 = Date.now();
     job.message = 'Finding highlight moments...';
     const audioCandidates = findHighlightClips(energy, hopSec, ctx.info.duration, ctx.words, CANDIDATE_POOL);
@@ -407,7 +564,12 @@ async function runPipeline(job, { url, uploadedPath, options }) {
 
     job.message = 'Refining cut boundaries with semantic analysis...';
     const semanticT0 = Date.now();
-    const ranked = await semantic.rankCandidatesSemantic(selected, ctx.words, { mapLimit });
+    const narrativeArc = await narrativePromise;
+    // Plan doc M4 — persisted on ctx (not just used once here) so renderOneClip (called later,
+    // per-candidate) can also read it when planning reaction cutaways, without re-running the
+    // whole-video narrative pass again.
+    ctx.narrativeBeats = narrativeArc?.beats || [];
+    const ranked = await semantic.rankCandidatesSemantic(selected, ctx.words, { narrativeBeats: ctx.narrativeBeats, mapLimit });
     job.timings.semanticMs = Date.now() - semanticT0;
     const notSelected = mergedPool.filter((c) => !selected.includes(c));
     notSelected.forEach((c) => { c.cutScore = c.score; });
@@ -448,34 +610,121 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     }
     job.timings.visionMs = Date.now() - visionT0;
 
-    const accepted = [];
-    for (let poolIndex = 0; poolIndex < job.candidates.length && accepted.length < autoCount; poolIndex++) {
+    // Secondary reordering signal (Component 4 — see plan doc): among the already-vision-
+    // checked, budget-limited slice, nudge promotion order by emotionalImportance. Never
+    // mutates job.candidates itself — its index is load-bearing (renderMore, applyManualEdit,
+    // and output filenames all key off job.candidates[i]) — this only reorders which INDICES
+    // get walked below, and the veto logic in that loop is completely unchanged. When no
+    // candidate has an emotionalImportance signal (vision unavailable, or the field absent),
+    // every scoreFor() call reduces to cand.cutScore, and since job.candidates is already
+    // cutScore-sorted, this re-sort is a stable no-op — provably the same order as today.
+    const checkedIndices = Array.from({ length: checkBudgetCount }, (_, i) => i);
+    const uncheckedIndices = Array.from({ length: job.candidates.length - checkBudgetCount }, (_, i) => i + checkBudgetCount);
+    const scoreFor = (poolIndex) => {
+      const cand = job.candidates[poolIndex];
+      const importance = cand.visionReport?.emotionalImportance;
+      return importance != null ? cand.cutScore + CUT_SCORE_WEIGHT_VISUAL_IMPORTANCE * importance : cand.cutScore;
+    };
+    checkedIndices.sort((a, b) => scoreFor(b) - scoreFor(a));
+    const promotionOrder = buildDiverseOrder(job.candidates, [...checkedIndices, ...uncheckedIndices]);
+
+    // Plan doc M5 — walks the FULL promotionOrder (not just the first autoCount) so every
+    // vision-veto/quality-floor-eligible candidate beyond autoCount is available as a
+    // backfill reserve for the post-render critic below, in the exact same eligibility order
+    // this loop already established. Eligibility criteria themselves are completely
+    // unchanged from M2.
+    const eligible = [];
+    let belowFloorCount = 0;
+    for (const poolIndex of promotionOrder) {
       const cand = job.candidates[poolIndex];
       if (cand.visionChecked === undefined) cand.visionChecked = false;
       const report = cand.visionChecked ? cand.visionReport : undefined;
       const rejected = !!(report && (report.renderable === false || report.editorialVerdict?.wouldUse === false));
-      console.log(`[stage=select] candidate=${poolIndex} ${rejected ? 'REJECTED' : 'accepted'} visionChecked=${cand.visionChecked}`);
-      if (!rejected) accepted.push(poolIndex);
+      if (rejected) {
+        console.log(`[stage=select] candidate=${poolIndex} REJECTED visionChecked=${cand.visionChecked}`);
+        continue;
+      }
+      if (!passesQualityFloor(cand)) {
+        belowFloorCount++;
+        console.log(`[stage=select] candidate=${poolIndex} below quality floor (cutScore=${cand.cutScore.toFixed(3)} < ${MIN_CLIP_QUALITY_FLOOR}) — skipped, not backfilled with a low-confidence clip`);
+        continue;
+      }
+      console.log(`[stage=select] candidate=${poolIndex} eligible visionChecked=${cand.visionChecked} category=${deriveMomentCategory(cand)}`);
+      eligible.push(poolIndex);
     }
+    const accepted = eligible.slice(0, autoCount);
+    const backfillReserve = eligible.slice(autoCount);
     const budgetExhausted = accepted.length < autoCount;
     if (budgetExhausted) {
-      console.log(`[stage=select] budgetExhausted=${checkBudgetCount < job.candidates.length} — ${autoCount - accepted.length} slot(s) may be filled without a vision veto`);
+      // Honest count (plan doc M2): when the quality floor is enabled and genuinely not
+      // enough candidates clear it, this now returns FEWER than autoCount rather than
+      // backfilling with a low-confidence candidate — the floor is opt-in (MIN_CLIP_QUALITY_FLOOR
+      // unset -> null -> passesQualityFloor always true), so with it disabled this log line
+      // and the resulting count are byte-identical to pre-M2 behavior.
+      console.log(`[stage=select] budgetExhausted=${checkBudgetCount < job.candidates.length} belowFloor=${belowFloorCount} — ${autoCount - accepted.length} slot(s) unfilled`);
     }
+    console.log(`[stage=select] initialAccepted=${accepted.length} backfillReserve=${backfillReserve.length}`);
 
     job.results = accepted.map((poolIndex) => ({ candidateIndex: poolIndex, status: 'pending' }));
     job.status = 'rendering';
 
     // Render clips concurrently instead of one-at-a-time so the wait scales with clip count
-    // divided by CPU cores, not multiplied by it.
-    await mapLimit(job.results, CONCURRENCY, async (entry) => {
-      try {
-        await renderOneClip(job, ctx, entry, entry.candidateIndex);
-      } catch (err) {
-        entry.status = 'error';
-        entry.message = err.message;
-        console.error(`Clip ${entry.candidateIndex} failed:`, err);
+    // divided by CPU cores, not multiplied by it. Plan doc M5 — after each render, run the
+    // post-render critic (a no-op whenever it's unavailable, exactly like every other LLM
+    // call site in this app); a REJECTED clip's slot is backfilled from `backfillReserve`,
+    // one replacement per rejection, up to MAX_CRITIC_BACKFILL_ATTEMPTS total — a
+    // pathologically bad source can only ever make the job return fewer clips, never loop
+    // forever or force a rejected clip through. `currentBatch` (not job.results) is what
+    // mapLimit iterates, so splicing job.results on a rejection can never corrupt a
+    // concurrent worker's indexing into the array it's actually walking.
+    let currentBatch = job.results;
+    let backfillCursor = 0;
+    let backfillAttempts = 0;
+    while (currentBatch.length) {
+      let rejectedCount = 0;
+      await mapLimit(currentBatch, CONCURRENCY, async (entry) => {
+        try {
+          await renderOneClip(job, ctx, entry, entry.candidateIndex);
+        } catch (err) {
+          entry.status = 'error';
+          entry.message = err.message;
+          console.error(`Clip ${entry.candidateIndex} failed:`, err);
+          return; // pre-existing behavior: a render ERROR is never backfilled, only a critic reject is
+        }
+        const cand = job.candidates[entry.candidateIndex];
+        const critiqueTmp = path.join(ctx.jobTmp, `critique_${entry.candidateIndex}_${Date.now()}`);
+        fs.mkdirSync(critiqueTmp, { recursive: true });
+        let verdict = null;
+        try {
+          verdict = await critic.critiqueRenderedClip({
+            outputPath: path.join(ctx.jobOut, `short_${entry.candidateIndex}.mp4`),
+            words: cand?.localWords || [],
+            segments: entry.segments || [],
+            durationSec: entry.length,
+            tmpDir: critiqueTmp,
+          });
+        } catch (err) {
+          console.warn(`[stage=critic] candidate=${entry.candidateIndex} critique failed, proceeding without a veto:`, err.message);
+        } finally {
+          fs.rm(critiqueTmp, { recursive: true, force: true }, () => {});
+        }
+        if (applyCriticVerdict(job, entry, verdict)) rejectedCount++;
+      });
+
+      if (!rejectedCount) break;
+      const replacements = [];
+      while (replacements.length < rejectedCount && backfillCursor < backfillReserve.length && backfillAttempts < MAX_CRITIC_BACKFILL_ATTEMPTS) {
+        const poolIndex = backfillReserve[backfillCursor++];
+        backfillAttempts++;
+        const replacementEntry = { candidateIndex: poolIndex, status: 'pending' };
+        job.results.push(replacementEntry);
+        replacements.push(replacementEntry);
       }
-    });
+      if (!replacements.length) {
+        console.log(`[stage=critic] backfill exhausted (reserve=${backfillReserve.length - backfillCursor} remaining, attempts=${backfillAttempts}/${MAX_CRITIC_BACKFILL_ATTEMPTS}) — job will return fewer than ${autoCount} clips`);
+      }
+      currentBatch = replacements;
+    }
 
     job._ctx = ctx; // kept alive for "generate more" requests
     job.status = 'done';
@@ -583,4 +832,7 @@ async function applyManualEdit(job, candidateIndex, editedSegments) {
   }
 }
 
-module.exports = { runPipeline, renderMore, applyManualEdit, OUTPUT_DIR, TMP_DIR };
+module.exports = {
+  runPipeline, renderMore, applyManualEdit, OUTPUT_DIR, TMP_DIR,
+  deriveMomentCategory, buildDiverseOrder, passesQualityFloor, applyCriticVerdict,
+};

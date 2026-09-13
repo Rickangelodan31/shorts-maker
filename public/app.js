@@ -239,6 +239,37 @@ function buildHookSection(entry, jobId) {
       body.appendChild(altWrap);
     }
 
+    if (hook.caption || (hook.hashtags && hook.hashtags.length)) {
+      const captionBox = document.createElement('div');
+      captionBox.className = 'hook-caption-box';
+      const label = document.createElement('div');
+      label.className = 'hook-more-label';
+      label.textContent = 'POST CAPTION';
+      captionBox.appendChild(label);
+      if (hook.caption) {
+        const captionText = document.createElement('p');
+        captionText.className = 'hook-caption-text';
+        captionText.textContent = hook.caption;
+        captionBox.appendChild(captionText);
+      }
+      if (hook.hashtags && hook.hashtags.length) {
+        const tagsText = document.createElement('p');
+        tagsText.className = 'hook-hashtags-text';
+        tagsText.textContent = hook.hashtags.join(' ');
+        captionBox.appendChild(tagsText);
+      }
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'hook-copy-btn';
+      copyBtn.textContent = 'Copy caption + hashtags';
+      copyBtn.addEventListener('click', () => {
+        const full = [hook.caption, (hook.hashtags || []).join(' ')].filter(Boolean).join('\n\n');
+        navigator.clipboard?.writeText(full).catch(() => {});
+      });
+      captionBox.appendChild(copyBtn);
+      body.appendChild(captionBox);
+    }
+
     const controls = document.createElement('div');
     controls.className = 'hook-controls';
     controls.innerHTML = `

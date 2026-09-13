@@ -3,7 +3,7 @@ const { run, FFMPEG_BIN, HAS_CAPTIONS, HAS_VIDEOTOOLBOX } = require('./ffutil');
 const {
   OUT_W: DEFAULT_OUT_W, OUT_H: DEFAULT_OUT_H,
   evenify, cropBoxFor, cropBoxForRegion, regionBoundedCropBox, regionToPixelBox,
-  FACE_CROP_MARGIN_STEPS, INSET_FACE_AR,
+  FACE_CROP_MARGIN_STEPS, INSET_FACE_AR, buildAnimatedCropExprs,
 } = require('./geometry');
 
 // When several clips render concurrently, cap each ffmpeg's thread count so they share
@@ -37,6 +37,22 @@ function fitBoxFilter(vBase, vOut, box, srcW, srcH, targetW, targetH) {
   parts.push(`[${vBase}fg]scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease[${vBase}fgfit]`);
   parts.push(`[${vBase}bgblur][${vBase}fgfit]overlay=(W-w)/2:(H-h)/2,setsar=1[${vOut}]`);
   return parts;
+}
+
+// Plan doc M7 — continuous subject tracking. Builds an ffmpeg crop filter string: a plain
+// static crop when no keyframes are present (today's exact behavior, byte-identical), or a
+// smoothly panning crop when effects.js attached `layout.keyframes`/`layout.keyframeSize`
+// (buildKeyframesForRun). render.js stays purely mechanical here — it never decides WHETHER
+// interpolation is safe (effects.js already re-validated every keyframe before attaching
+// them); this only turns already-validated data into filter syntax. `x='EXPR'`/`y='EXPR'`
+// (quoted) is ffmpeg's documented form for a crop filter's x/y in per-frame expression mode.
+function cropFilterStr(layout, staticBox, srcW, srcH) {
+  if (layout?.keyframes?.length >= 2 && layout.keyframeSize) {
+    const { w, h } = layout.keyframeSize;
+    const { xExpr, yExpr } = buildAnimatedCropExprs(layout.keyframes, srcW, srcH, w, h);
+    return `crop=${w}:${h}:x='${xExpr}':y='${yExpr}'`;
+  }
+  return `crop=${staticBox.w}:${staticBox.h}:${staticBox.x}:${staticBox.y}`;
 }
 
 // Builds the filter_complex for one segment's layout (single crop, split-screen, fit, or a
@@ -73,7 +89,7 @@ function layoutFilter(vBase, layout, srcW, srcH, outW = DEFAULT_OUT_W, outH = DE
     const faceMargin = layout.faceMargin ?? FACE_CROP_MARGIN_STEPS[0];
     const faceCrop = cropBoxForRegion(srcW, srcH, layout.faceBox, targetAR, faceMargin);
     parts.push(`[${vBase}]split=2[${vBase}x][${vBase}y]`);
-    parts.push(`[${vBase}x]crop=${faceCrop.w}:${faceCrop.h}:${faceCrop.x}:${faceCrop.y},scale=${outW}:${bandH},setsar=1[${vBase}p1]`);
+    parts.push(`[${vBase}x]${cropFilterStr(layout, faceCrop, srcW, srcH)},scale=${outW}:${bandH},setsar=1[${vBase}p1]`);
     // The content half gets its OWN framing decision (effects.js:decideContentFraming) —
     // a cover-crop when little would be lost, or a content-preserving contain+blur fit
     // when a crop would have to cut off gameplay/UI/action to fill the band. Both branches
@@ -109,7 +125,7 @@ function layoutFilter(vBase, layout, srcW, srcH, outW = DEFAULT_OUT_W, outH = DE
       const contentCrop = regionBoundedCropBox(srcW, srcH, layout.contentBox, outW / outH);
       parts.push(`[${vBase}bg]crop=${contentCrop.w}:${contentCrop.h}:${contentCrop.x}:${contentCrop.y},scale=${outW}:${outH},setsar=1[${vBase}bgout]`);
     }
-    parts.push(`[${vBase}fg]crop=${faceCrop.w}:${faceCrop.h}:${faceCrop.x}:${faceCrop.y},scale=${insetW}:${insetH},setsar=1[${vBase}fgout]`);
+    parts.push(`[${vBase}fg]${cropFilterStr(layout, faceCrop, srcW, srcH)},scale=${insetW}:${insetH},setsar=1[${vBase}fgout]`);
     parts.push(`[${vBase}bgout][${vBase}fgout]overlay=W-w-${marginPx}:H-h-${marginPx}[${vOut}]`);
   } else if (layout.type === 'fit') {
     // Show the WHOLE frame (or, if layout.box is set, just that source region — see
@@ -130,7 +146,7 @@ function layoutFilter(vBase, layout, srcW, srcH, outW = DEFAULT_OUT_W, outH = DE
       : layout.manualCrop
         ? cropBoxForRegion(srcW, srcH, layout.manualCrop, targetAR, layout.manualCropMargin ?? 0.15)
         : cropBoxFor(srcW, srcH, layout.slot.cx, layout.slot.cy, targetAR);
-    parts.push(`[${vBase}]crop=${box.w}:${box.h}:${box.x}:${box.y},scale=${outW}:${outH},setsar=1[${vOut}]`);
+    parts.push(`[${vBase}]${cropFilterStr(layout, box, srcW, srcH)},scale=${outW}:${outH},setsar=1[${vOut}]`);
   }
   return { parts, vOut };
 }

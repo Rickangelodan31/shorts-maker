@@ -353,7 +353,7 @@ function findClipForCaptions(jobId, candidateIndex) {
   return { job, entry, cand };
 }
 
-const EMPTY_HOOK = { status: 'ready', primary: null, alternatives: [], analysis: null, selectedText: null };
+const EMPTY_HOOK = { status: 'ready', primary: null, alternatives: [], caption: null, hashtags: [], selectedText: null };
 
 app.post('/api/captions/generate', ah(async (req, res) => {
   const { videoId, candidateIndex, action, style, userCaption } = req.body || {};

@@ -841,6 +841,25 @@ main {
   margin: 10px 0 6px;
 }
 .hook-alt-list { display: grid; gap: 6px; }
+.hook-caption-box {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-top: 10px;
+}
+.hook-caption-text { font-size: 0.9rem; line-height: 1.4; margin: 0 0 6px; }
+.hook-hashtags-text { font-size: 0.85rem; color: var(--accent); margin: 0 0 8px; }
+.hook-caption-box .hook-copy-btn {
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.hook-caption-box .hook-copy-btn:hover { border-color: var(--accent); }
 .hook-controls { margin-top: 12px; display: grid; gap: 8px; }
 .hook-generate-row { display: flex; gap: 8px; }
 .hook-style-select {

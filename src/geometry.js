@@ -164,8 +164,64 @@ function regionToPixelBox(srcW, srcH, region) {
   return { w, h, x, y };
 }
 
+// Plan doc M7 — continuous subject tracking (v1: position-only pan, fixed crop size). Builds
+// an ffmpeg filter expression string for piecewise-LINEAR interpolation over `keyframes`
+// ([{t, value}], sorted ascending, t in seconds relative to the segment's own trimmed
+// timeline — matches ffmpeg's per-frame `t` variable after this segment's setpts reset).
+// Constant before the first keyframe and after the last; linear between each adjacent pair.
+// A single keyframe (or none) degenerates to a constant expression — never a division by
+// zero or a malformed string. Kept as a small, independently-testable pure function since a
+// syntax error here would break rendering for every affected clip.
+function buildPiecewiseLinearExpr(keyframes) {
+  if (!keyframes || !keyframes.length) return '0';
+  const fmt = (n) => n.toFixed(4);
+  if (keyframes.length === 1) return fmt(keyframes[0].value);
+  let expr = fmt(keyframes[keyframes.length - 1].value);
+  for (let i = keyframes.length - 2; i >= 0; i--) {
+    const a = keyframes[i];
+    const b = keyframes[i + 1];
+    const span = b.t - a.t;
+    const lerp = span > 0
+      ? `(${fmt(a.value)}+(${fmt(b.value)}-${fmt(a.value)})*(t-${fmt(a.t)})/${fmt(span)})`
+      : fmt(a.value);
+    expr = `if(lt(t,${fmt(b.t)}),${lerp},${expr})`;
+  }
+  return `if(lt(t,${fmt(keyframes[0].t)}),${fmt(keyframes[0].value)},${expr})`;
+}
+
+// Plain-JS reference evaluator for the SAME piecewise-linear definition buildPiecewiseLinearExpr
+// encodes as an ffmpeg string — used by render.js/effects.js (and tests) whenever the actual
+// numeric value is needed outside ffmpeg, e.g. to sanity-check a generated expression's shape.
+// Must stay logically identical to buildPiecewiseLinearExpr's semantics.
+function interpolateAt(keyframes, t) {
+  if (!keyframes || !keyframes.length) return 0;
+  if (t <= keyframes[0].t) return keyframes[0].value;
+  for (let i = 0; i < keyframes.length - 1; i++) {
+    const a = keyframes[i];
+    const b = keyframes[i + 1];
+    if (t < b.t) return a.value + (b.value - a.value) * (t - a.t) / (b.t - a.t);
+  }
+  return keyframes[keyframes.length - 1].value;
+}
+
+// keyframes: [{t, cx, cy}] (already-validated normalized positions — see
+// effects.js:buildKeyframesForRun, which is what guarantees "only interpolate between
+// already-valid boxes"). w/h: the FIXED crop size to pan within (constant across every
+// keyframe — see buildKeyframesForRun for why this is always safe). Returns {xExpr, yExpr}:
+// ffmpeg filter expression strings for a crop filter's x/y in expression mode. The same
+// clamp-to-source-bounds math cropBoxFor/cropBoxForRegion already use, just evaluated once
+// per keyframe instead of once per whole segment.
+function buildAnimatedCropExprs(keyframes, srcW, srcH, w, h) {
+  const clampX = (cx) => Math.max(0, Math.min(srcW - w, cx * srcW - w / 2));
+  const clampY = (cy) => Math.max(0, Math.min(srcH - h, cy * srcH - h / 2));
+  const xKeyframes = keyframes.map((k) => ({ t: k.t, value: clampX(k.cx) }));
+  const yKeyframes = keyframes.map((k) => ({ t: k.t, value: clampY(k.cy) }));
+  return { xExpr: buildPiecewiseLinearExpr(xKeyframes), yExpr: buildPiecewiseLinearExpr(yKeyframes) };
+}
+
 module.exports = {
   OUT_W, OUT_H, evenify, cropBoxFor, cropBoxForRegion, regionBoundedCropBox,
   FACE_CROP_MARGIN_STEPS, INSET_FACE_AR,
   CONTENT_FIT_LOSS_THRESHOLD, coverCropRetainedFraction, decideCropOrFit, regionToPixelBox,
+  buildPiecewiseLinearExpr, interpolateAt, buildAnimatedCropExprs,
 };

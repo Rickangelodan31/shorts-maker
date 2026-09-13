@@ -7,6 +7,18 @@ let canvas = null;
 let modelsReady = false;
 let available = true;
 
+// CV-fallback reaction-composite confidence tuning (see detectReactionComposite below).
+const COMPOSITE_EDGE_TOLERANCE = parseFloat(process.env.COMPOSITE_EDGE_TOLERANCE || '0.08');
+const COMPOSITE_CORNER_ANCHOR_BONUS = parseFloat(process.env.COMPOSITE_CORNER_ANCHOR_BONUS || '0.25');
+const COMPOSITE_CORNER_ANCHOR_MAX_AREA = parseFloat(process.env.COMPOSITE_CORNER_ANCHOR_MAX_AREA || '0.5');
+
+// Speaker-activity ("who's actually talking") tuning — see detectPeopleInWindow's
+// speakingScore computation below. Deliberately conservative defaults; see the plan doc's
+// Component 5 risk note on ~3-sample/chunk sparsity before raising these.
+const SPEAKER_MOUTH_VARIANCE_FLOOR = parseFloat(process.env.SPEAKER_MOUTH_VARIANCE_FLOOR || '0.002');
+const SPEAKER_MIN_SAMPLES_FOR_CONFIDENCE = parseInt(process.env.SPEAKER_MIN_SAMPLES_FOR_CONFIDENCE || '3', 10);
+const SPEAKER_MIN_DETECTION_SCORE = parseFloat(process.env.SPEAKER_MIN_DETECTION_SCORE || '0.4');
+
 function tryInit() {
   if (faceapi) return true;
   try {
@@ -53,6 +65,20 @@ function eyeCenter(landmarks, imgW, imgH) {
   const sx = pts.reduce((a, p) => a + p.x, 0) / pts.length;
   const sy = pts.reduce((a, p) => a + p.y, 0) / pts.length;
   return { cx: sx / imgW, cy: sy / imgH };
+}
+
+// Mouth-aspect-ratio-like proxy (vertical/horizontal span of the mouth landmark contour
+// already extracted for every detection) — not an open/closed classifier, just a per-frame
+// number whose VARIANCE over a window's samples correlates with lip movement. Reuses
+// face-api's existing 20-point mouth contour (outer+inner lip) — no new landmark model, no
+// added extraction cost. See detectPeopleInWindow's speakingScore computation below.
+function mouthOpenness(landmarks) {
+  const pts = landmarks.getMouth();
+  const ys = pts.map((p) => p.y);
+  const xs = pts.map((p) => p.x);
+  const vSpan = Math.max(...ys) - Math.min(...ys);
+  const hSpan = Math.max(...xs) - Math.min(...xs) || 1;
+  return vSpan / hSpan;
 }
 
 // Full-landmark pixel-space bounding box (jaw/brow/nose/mouth/eyes — the 68-point model
@@ -153,6 +179,24 @@ function clusterByX(points, k, seedCentroids) {
   return { centroids: sortedCentroids, assign: remappedAssign };
 }
 
+// A genuine facecam overlay is placed, by convention, flush against at least one horizontal
+// AND one vertical frame edge (a corner or edge dock) — independent of how much the reactor
+// moves their head inside that fixed box. detectReactionComposite's position-stability score
+// (below) tracks the FACE point, so an energetic reactor who moves a lot inside an otherwise
+// perfectly static overlay box gets penalized as if the overlay itself were unstable. This is
+// a second, independent signal: a single stationary talking-head shot (the case this whole
+// CV-fallback path must stay conservative against — it "cannot reliably distinguish an
+// overlay from a genuinely motionless tripod-mounted talking head") is virtually always
+// framed centered, not edge-anchored, so corner-anchoring doesn't relax that safety property.
+// Capped to boxes that don't already cover most of the frame, so a close-up single-person
+// shot that happens to sit near one edge can't wrongly qualify as an overlay.
+function isCornerAnchoredOverlay(x0, y0, x1, y1) {
+  const touchesHorizontal = x0 <= COMPOSITE_EDGE_TOLERANCE || x1 >= 1 - COMPOSITE_EDGE_TOLERANCE;
+  const touchesVertical = y0 <= COMPOSITE_EDGE_TOLERANCE || y1 >= 1 - COMPOSITE_EDGE_TOLERANCE;
+  const area = (x1 - x0) * (y1 - y0);
+  return touchesHorizontal && touchesVertical && area <= COMPOSITE_CORNER_ANCHOR_MAX_AREA;
+}
+
 // Greedy radius-based 2D clustering (unlike clusterByX, which is x-only and needs a fixed
 // k) — used only by detectReactionComposite, where the number of distinct regions isn't
 // known up front and a facecam overlay can sit anywhere in frame, not just left/right.
@@ -188,7 +232,13 @@ function greedyCluster2D(points, radius = 0.1) {
 // mode), faces outside this box are discarded before clustering, so content-region imagery
 // can't contaminate person detection. opts.seedCentroids: see clusterByX.
 async function detectPeopleInWindow(videoPath, start, length, tmpDir, srcW, srcH, sampleCount = 6, opts = {}) {
-  const fallback = { faceCount: 0, slots: [{ cx: 0.5, cy: 0.42, w: 0.3, h: 0.3 }], expressiveMoments: [], confidence: 0 };
+  // opts.words (optional, [{start,end,text}] LOCAL to this window): when given, gates the
+  // speakingScore computation below — see the plan doc's Component 5.
+  const fallback = {
+    faceCount: 0,
+    slots: [{ cx: 0.5, cy: 0.42, w: 0.3, h: 0.3, speakingScore: null, speakingConfidence: 0 }],
+    expressiveMoments: [], confidence: 0,
+  };
 
   if (!tryInit()) return fallback;
   try {
@@ -227,6 +277,7 @@ async function detectPeopleInWindow(videoPath, start, length, tmpDir, srcW, srcH
           h: d.detection.box.height / img.height,
           score: d.detection.score,
           nonNeutral,
+          mouthOpen: mouthOpenness(d.landmarks),
           tLocal,
           landmarkBox: faceLandmarkBoxPx(d.landmarks),
         };
@@ -337,6 +388,35 @@ async function detectPeopleInWindow(videoPath, start, length, tmpDir, srcW, srcH
     expressiveMoments.push({ clusterIndex, localT: best.tLocal, score: best.nonNeutral });
   });
 
+  // Speaker-activity signal ("which detected face is currently vocalizing"): mouth-openness
+  // VARIANCE per cluster across this window's samples, normalized relative to other clusters
+  // in the SAME window (not an absolute threshold) — more robust to per-video lighting/
+  // distance, and partially cancels sampling noise since every face suffers the same sparse
+  // sampling. Gated on real speech being present (opts.words) AND the strongest cluster
+  // clearing a noise floor; otherwise every slot gets speakingScore=null (not 0) — null
+  // means "unknown," 0 would wrongly claim "confidently not talking." This is a positional
+  // signal only, never an identity claim (mirrors the "never assert who is speaking to
+  // whom" rule already followed by the semantic.js LLM prompts).
+  const hasSpeech = !!(opts.words && opts.words.length);
+  let speakingBySlot = slots.map(() => ({ speakingScore: null, speakingConfidence: 0 }));
+  if (hasSpeech) {
+    const perCluster = slots.map((_, clusterIndex) => {
+      const pts = allPoints.filter((p, i) => assign[i] === clusterIndex && (p.score || 0) >= SPEAKER_MIN_DETECTION_SCORE && p.mouthOpen != null);
+      if (pts.length < 2) return { variance: 0, count: pts.length };
+      const mean = pts.reduce((a, p) => a + p.mouthOpen, 0) / pts.length;
+      const variance = pts.reduce((a, p) => a + (p.mouthOpen - mean) ** 2, 0) / pts.length;
+      return { variance, count: pts.length };
+    });
+    const maxVariance = Math.max(0, ...perCluster.map((c) => c.variance));
+    if (maxVariance >= SPEAKER_MOUTH_VARIANCE_FLOOR) {
+      speakingBySlot = perCluster.map((c) => ({
+        speakingScore: c.variance / maxVariance,
+        speakingConfidence: Math.min(1, c.count / SPEAKER_MIN_SAMPLES_FOR_CONFIDENCE),
+      }));
+    }
+  }
+  slots = slots.map((s, i) => ({ ...s, speakingScore: speakingBySlot[i].speakingScore, speakingConfidence: speakingBySlot[i].speakingConfidence }));
+
   return { faceCount: slots.length, slots, expressiveMoments, confidence };
 }
 
@@ -351,7 +431,12 @@ async function detectPeopleInWindow(videoPath, start, length, tmpDir, srcW, srcH
 // positions are EMA-blended instead of jumping; when topology changes, it must repeat for
 // CONFIRM_CHUNKS consecutive chunks (or arrive with very high confidence) before being
 // adopted, so one noisy chunk can't flip the whole clip's layout.
-async function detectLayoutTimeline(videoPath, absStart, length, tmpDir, srcW, srcH, chunkSec = 12, reactionComposite = null) {
+// `words` (optional, [{start,end,text}] LOCAL to the whole clip, same convention as
+// pipeline.js's localWords): when given, sliced per-chunk and passed down so
+// detectPeopleInWindow can compute a speakingScore per face slot (see Component 5 of the
+// plan doc). Omitting it (existing call sites) reproduces today's exact behavior — every
+// slot just gets speakingScore=null.
+async function detectLayoutTimeline(videoPath, absStart, length, tmpDir, srcW, srcH, chunkSec = 12, reactionComposite = null, words = null) {
   const chunks = [];
   let t = 0;
   while (t < length) {
@@ -372,16 +457,23 @@ async function detectLayoutTimeline(videoPath, absStart, length, tmpDir, srcW, s
 
   const restrictToBox = reactionComposite?.isReactionComposite ? reactionComposite.facecamBox : undefined;
 
+  // A carried-forward-from-prior slot has no fresh mouth data for the CURRENT chunk — mouth
+  // activity is inherently time-varying (unlike position, which is fine to reuse briefly),
+  // so presenting a stale speakingScore as "current" would be actively misleading. Null it
+  // out (not carry it) whenever slots are reused from `prior` rather than freshly detected.
+  const clearSpeaking = (slotList) => slotList.map((s) => ({ ...s, speakingScore: null, speakingConfidence: 0 }));
+
   for (const c of chunks) {
     const seedCentroids = prior && prior.slots.length ? prior.slots.map((s) => s.cx) : undefined;
+    const chunkWords = words ? words.filter((w) => w.start >= c.start && w.end <= c.end) : null;
     const raw = await detectPeopleInWindow(
       videoPath, absStart + c.start, c.end - c.start, tmpDir, srcW, srcH, 3,
-      { restrictToBox, seedCentroids }
+      { restrictToBox, seedCentroids, words: chunkWords }
     );
 
     let people;
     if (raw.faceCount === 0 && prior) {
-      people = { ...prior, expressiveMoments: [], occluded: true, confidence: 0 };
+      people = { ...prior, slots: clearSpeaking(prior.slots), expressiveMoments: [], occluded: true, confidence: 0 };
     } else if (prior && raw.faceCount === prior.faceCount) {
       const slots = raw.slots.map((s, i) => {
         const p = prior.slots[i];
@@ -392,6 +484,9 @@ async function detectLayoutTimeline(videoPath, absStart, length, tmpDir, srcW, s
           w: ALPHA * s.w + (1 - ALPHA) * p.w,
           h: ALPHA * s.h + (1 - ALPHA) * p.h,
           landmarkBox: s.landmarkBox || p.landmarkBox,
+          // Speaking info comes from the FRESH raw detection, unblended — see comment above.
+          speakingScore: s.speakingScore,
+          speakingConfidence: s.speakingConfidence,
         };
       });
       people = { faceCount: raw.faceCount, slots, expressiveMoments: raw.expressiveMoments, confidence: raw.confidence };
@@ -409,12 +504,12 @@ async function detectLayoutTimeline(videoPath, absStart, length, tmpDir, srcW, s
           pendingTopology = null;
           pendingStreak = 0;
         } else {
-          people = { ...prior, expressiveMoments: raw.expressiveMoments, confidence: prior.confidence };
+          people = { ...prior, slots: clearSpeaking(prior.slots), expressiveMoments: raw.expressiveMoments, confidence: prior.confidence };
         }
       } else {
         pendingTopology = raw.faceCount;
         pendingStreak = 1;
-        people = { ...prior, expressiveMoments: raw.expressiveMoments, confidence: prior.confidence };
+        people = { ...prior, slots: clearSpeaking(prior.slots), expressiveMoments: raw.expressiveMoments, confidence: prior.confidence };
       }
     } else {
       people = raw; // first chunk, nothing to smooth against yet
@@ -506,7 +601,15 @@ async function detectReactionComposite(videoPath, absStart, length, tmpDir, srcW
   if (y1 > 0.92) y1 = 1;
   x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(1, x1); y1 = Math.min(1, y1);
 
-  const confidence = Math.max(0, Math.min(1, bestScore));
+  // See isCornerAnchoredOverlay above: boosts confidence for a box that's independently
+  // recognizable as an overlay by its screen position, on top of (never instead of) the
+  // position-stability score — a zero-stability cluster still can't pass on anchoring alone.
+  const anchored = isCornerAnchoredOverlay(x0, y0, x1, y1);
+  const confidence = Math.max(0, Math.min(1, bestScore + (anchored ? COMPOSITE_CORNER_ANCHOR_BONUS : 0)));
+  console.log(
+    `[stage=layout] reactionComposite(cv-fallback) agreementFrac=${best.agreementFrac.toFixed(2)} ` +
+    `spreadMax=${best.spreadMax.toFixed(4)} cornerAnchored=${anchored} confidence=${confidence.toFixed(2)}`
+  );
   return {
     isReactionComposite: true,
     facecamBox: { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, w: x1 - x0, h: y1 - y0 },
@@ -542,6 +645,6 @@ async function quickHasAnyFace(videoPath, tAbs, tmpDir) {
 
 module.exports = {
   detectPeopleInWindow, detectLayoutTimeline, detectReactionComposite, quickHasAnyFace,
-  validateFaceCrop, faceLandmarkBoxPx, clusterByX,
+  validateFaceCrop, faceLandmarkBoxPx, clusterByX, mouthOpenness, isCornerAnchoredOverlay,
   isAvailable: () => available,
 };
