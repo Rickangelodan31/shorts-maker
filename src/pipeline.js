@@ -11,7 +11,7 @@ const { detectLayoutTimeline, detectReactionComposite, quickHasAnyFace } = requi
 const { renderSegmented } = require('./render');
 const { planClipSegments, mapUserTypeToLayout } = require('./effects');
 const { buildCaptionsAss } = require('./captions');
-const { probeUrlMeta, downloadAudioOnly, downloadSection } = require('./ingest');
+const { probeUrlMeta, downloadAudioOnly, downloadSection, downloadLowResVideoProxy } = require('./ingest');
 const captionAi = require('./captionAi/generator');
 const critic = require('./critic');
 
@@ -23,6 +23,43 @@ const CANDIDATE_POOL = 20;
 // editorially meaningless. The visual pool gets a smaller raw cap than the audio pool
 // (further trimmed again in candidates.js's semantic-pass selection).
 const VISUAL_CANDIDATE_POOL = 10;
+// Plan doc M8 — URL job visual-candidate parity. A low-res whole-video proxy download is
+// only attempted under this duration ceiling (default 30min), so a multi-hour VOD doesn't
+// silently trigger a large extra download just for the visual scan — a real, stated
+// bandwidth/latency tradeoff, not hidden behind a always-on default. Above the ceiling (or on
+// any failure), URL jobs fall back to today's exact audio-only candidate behavior.
+const URL_VISUAL_PROXY_MAX_DURATION_SEC = parseFloat(process.env.URL_VISUAL_PROXY_MAX_DURATION_SEC || '1800');
+
+// Pure gate — no I/O — so it's directly testable without touching yt-dlp/ffmpeg. Same
+// DISABLE_VISUAL_SCAN flag already gates the upload path, so one env var controls both.
+function shouldAttemptUrlVisualProxy(durationSec, maxDurationSec = URL_VISUAL_PROXY_MAX_DURATION_SEC) {
+  if (process.env.DISABLE_VISUAL_SCAN === '1') return false;
+  return typeof durationSec === 'number' && durationSec > 0 && durationSec <= maxDurationSec;
+}
+
+// Plan doc M8 — downloads a low-res whole-video proxy and runs the SAME
+// computeVisualInterestTimeline the upload path already uses, for a URL job. Returns null
+// (never throws) whenever the job is over the duration ceiling or ANY step fails — the
+// caller must treat null exactly like "no visual signal," falling back to today's exact
+// pre-M8 audio-only URL behavior. `deps` (optional): override downloadLowResVideoProxy/
+// computeVisualInterestTimeline for testing — production call sites never pass it, so they
+// always use the real implementations.
+async function tryBuildUrlVisualInterest(url, jobId, jobTmp, durationSec, onProgress, deps = {}) {
+  if (!shouldAttemptUrlVisualProxy(durationSec)) return null;
+  const download = deps.downloadLowResVideoProxy || downloadLowResVideoProxy;
+  const scan = deps.computeVisualInterestTimeline || computeVisualInterestTimeline;
+  let proxyPath = null;
+  try {
+    proxyPath = await download(url, jobId, jobTmp, onProgress);
+    return await scan(proxyPath, durationSec);
+  } catch (err) {
+    console.warn(`[stage=generate] URL visual proxy scan failed, falling back to audio-only candidates: ${err.message}`);
+    return null;
+  } finally {
+    if (proxyPath) fs.rm(proxyPath, () => {});
+  }
+}
+
 const CONCURRENCY = Math.max(1, Math.min(4, os.cpus().length - 1));
 // Plan doc M7 — denser face-detection keyframes (down from the original 12s), applied ONLY
 // here in renderOneClip — i.e. only for a candidate that has already passed vision-veto and
@@ -540,14 +577,25 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     const audioCandidates = findHighlightClips(energy, hopSec, ctx.info.duration, ctx.words, CANDIDATE_POOL);
     audioCandidates.forEach((c) => console.log(`[stage=generate] source=audio start=${c.start.toFixed(1)} end=${c.end.toFixed(1)} score=${c.score.toFixed(3)}`));
 
-    // Visual candidate generation needs actual video frames. For uploaded files the source
-    // is already local (cheap); for URL jobs only audio has been downloaded at this point
-    // (the whole point of the fast path), so the visual pass is skipped there rather than
-    // forcing a full video download just to run it — audio-only candidates still apply.
+    // Visual candidate generation needs actual video frames. Uploaded files are already
+    // local (cheap). Plan doc M8: URL jobs only have audio downloaded at this point (the
+    // whole point of the fast path), so a cheap low-res whole-video PROXY is attempted just
+    // for this scan (bounded by URL_VISUAL_PROXY_MAX_DURATION_SEC) — on any failure or over
+    // the ceiling, tryBuildUrlVisualInterest returns null and this degrades to today's exact
+    // pre-M8 audio-only URL behavior, never failing the job.
     let visualCandidates = [];
+    let visualScanResult = null;
     if (!url && process.env.DISABLE_VISUAL_SCAN !== '1') {
       job.message = 'Scanning for visual highlights...';
-      const { visualInterest, hopSec: visualHopSec } = await computeVisualInterestTimeline(uploadedPath, ctx.info.duration);
+      visualScanResult = await computeVisualInterestTimeline(uploadedPath, ctx.info.duration);
+    } else if (url && shouldAttemptUrlVisualProxy(ctx.info.duration)) {
+      job.message = 'Scanning for visual highlights (proxy)...';
+      visualScanResult = await tryBuildUrlVisualInterest(url, job.id, jobTmp, ctx.info.duration, (pct) => {
+        job.message = `Downloading visual proxy for scene analysis... ${pct.toFixed(0)}%`;
+      });
+    }
+    if (visualScanResult) {
+      const { visualInterest, hopSec: visualHopSec } = visualScanResult;
       ctx.visualInterest = visualInterest;
       ctx.visualHopSec = visualHopSec;
       ctx.visualInterestAvg = visualInterest.length ? visualInterest.reduce((a, b) => a + b, 0) / visualInterest.length : 0;
@@ -835,4 +883,5 @@ async function applyManualEdit(job, candidateIndex, editedSegments) {
 module.exports = {
   runPipeline, renderMore, applyManualEdit, OUTPUT_DIR, TMP_DIR,
   deriveMomentCategory, buildDiverseOrder, passesQualityFloor, applyCriticVerdict,
+  shouldAttemptUrlVisualProxy, tryBuildUrlVisualInterest,
 };

@@ -70,4 +70,28 @@ async function downloadSection(url, jobId, index, startSec, endSec, jobTmp, onPr
   return path.join(jobTmp, files[0]);
 }
 
-module.exports = { probeUrlMeta, downloadAudioOnly, downloadSection, UPLOAD_DIR };
+// Plan doc M8 — a cheap, WHOLE-VIDEO, video-only, low-resolution download used solely to
+// feed computeVisualInterestTimeline (visualscan.js), which already downscales internally to
+// 160px — a 240p source is already overkill for it. Video-only (no `+ba`) since the visual
+// scan never touches audio and this keeps the download as small as possible. Falls through
+// to progressively looser format strings (360p, then "worst available") only because some
+// sources don't expose a dedicated ≤240p video-only stream; the caller (pipeline.js) treats
+// ANY failure here as "no visual proxy available" and degrades to today's audio-only URL
+// behavior rather than failing the job.
+async function downloadLowResVideoProxy(url, jobId, jobTmp, onProgress) {
+  const outTemplate = path.join(jobTmp, `${jobId}_visualproxy.%(ext)s`);
+  await runWithProgress('yt-dlp', [
+    '--no-playlist', '--newline',
+    '-f', 'bv*[height<=240]/bv*[height<=360]/w',
+    '-o', outTemplate,
+    url,
+  ], (line) => {
+    const pct = parsePercent(line);
+    if (pct !== null && onProgress) onProgress(pct);
+  });
+  const files = fs.readdirSync(jobTmp).filter((f) => f.startsWith(`${jobId}_visualproxy.`));
+  if (!files.length) throw new Error('Visual proxy download did not produce a file');
+  return path.join(jobTmp, files[0]);
+}
+
+module.exports = { probeUrlMeta, downloadAudioOnly, downloadSection, downloadLowResVideoProxy, UPLOAD_DIR };
