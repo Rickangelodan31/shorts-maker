@@ -37,6 +37,14 @@ function shouldAttemptUrlVisualProxy(durationSec, maxDurationSec = URL_VISUAL_PR
   return typeof durationSec === 'number' && durationSec > 0 && durationSec <= maxDurationSec;
 }
 
+// Sets the job-level status shown in the UI before any clip exists: `message` is the short
+// editorial headline, `detail` the plain-language explanation of what's actually happening
+// right now. Kept as one helper so every stage uses the same two-line shape consistently.
+function setStatus(job, message, detail) {
+  job.message = message;
+  job.detail = detail;
+}
+
 // Plan doc M8 — downloads a low-res whole-video proxy and runs the SAME
 // computeVisualInterestTimeline the upload path already uses, for a URL job. Returns null
 // (never throws) whenever the job is over the duration ceiling or ANY step fails — the
@@ -534,35 +542,35 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     let wavPath;
     if (url) {
       job.status = 'downloading';
-      job.message = 'Fetching video info...';
+      setStatus(job, 'Getting your video ready…', 'Fetching the video details.');
       const meta = await probeUrlMeta(url);
       job.duration = meta.duration;
       ctx.info = meta;
 
-      job.message = 'Downloading audio for analysis...';
+      setStatus(job, 'Getting your video ready…', 'Downloading the audio for analysis.');
       job.progress = 0;
       wavPath = await downloadAudioOnly(url, job.id, jobTmp, (pct) => {
         job.progress = pct;
-        job.message = `Downloading audio for analysis... ${pct.toFixed(0)}%`;
+        setStatus(job, 'Getting your video ready…', `Downloading the audio for analysis… ${pct.toFixed(0)}%`);
       });
     } else {
       ctx.sourcePath = uploadedPath;
       job.status = 'analyzing';
-      job.message = 'Reading video...';
+      setStatus(job, 'Getting your video ready…', 'Reading your video file.');
       ctx.info = await probe(uploadedPath);
       job.duration = ctx.info.duration;
       wavPath = path.join(jobTmp, 'audio.wav');
-      job.message = 'Extracting audio...';
+      setStatus(job, 'Getting your video ready…', 'Pulling out the audio track.');
       await extractAudioWav(uploadedPath, wavPath);
     }
 
     job.status = 'analyzing';
-    job.message = 'Analyzing audio for uptempo / emotional moments...';
+    setStatus(job, 'Listening for energy and emotion…', 'Scanning the audio for exciting, high-energy moments.');
     const { energy, hopSec } = computeEnergyTimeline(wavPath);
     ctx.energy = energy;
     ctx.hopSec = hopSec;
 
-    job.message = 'Transcribing (local)...';
+    setStatus(job, 'Transcribing your audio…', 'Listening through the full video to understand what was said.');
     const transcript = await transcribeIfAvailable(wavPath);
     ctx.words = transcript?.words || [];
 
@@ -573,7 +581,7 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     const narrativePromise = semantic.analyzeNarrativeArc(ctx.words, ctx.info.duration);
 
     const candidateGenT0 = Date.now();
-    job.message = 'Finding highlight moments...';
+    setStatus(job, 'Finding the sweet spots…', 'Looking for strong hooks and sections worth turning into shorts.');
     const audioCandidates = findHighlightClips(energy, hopSec, ctx.info.duration, ctx.words, CANDIDATE_POOL);
     audioCandidates.forEach((c) => console.log(`[stage=generate] source=audio start=${c.start.toFixed(1)} end=${c.end.toFixed(1)} score=${c.score.toFixed(3)}`));
 
@@ -586,12 +594,12 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     let visualCandidates = [];
     let visualScanResult = null;
     if (!url && process.env.DISABLE_VISUAL_SCAN !== '1') {
-      job.message = 'Scanning for visual highlights...';
+      setStatus(job, 'Checking the video for visual highlights…', 'Scanning the footage for engaging visual moments.');
       visualScanResult = await computeVisualInterestTimeline(uploadedPath, ctx.info.duration);
     } else if (url && shouldAttemptUrlVisualProxy(ctx.info.duration)) {
-      job.message = 'Scanning for visual highlights (proxy)...';
+      setStatus(job, 'Checking the video for visual highlights…', 'Scanning a quick preview of the footage for engaging visual moments.');
       visualScanResult = await tryBuildUrlVisualInterest(url, job.id, jobTmp, ctx.info.duration, (pct) => {
-        job.message = `Downloading visual proxy for scene analysis... ${pct.toFixed(0)}%`;
+        setStatus(job, 'Checking the video for visual highlights…', `Downloading a quick preview to scan… ${pct.toFixed(0)}%`);
       });
     }
     if (visualScanResult) {
@@ -610,7 +618,7 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     console.log(`[stage=merge] selected ${selected.length}/${mergedPool.length} for semantic ranking (adaptive, not a fixed top-N)`);
     job.timings.candidateGenMs = Date.now() - candidateGenT0;
 
-    job.message = 'Refining cut boundaries with semantic analysis...';
+    setStatus(job, 'Picking the best clips…', 'Weighing context and story to choose the strongest cuts.');
     const semanticT0 = Date.now();
     const narrativeArc = await narrativePromise;
     // Plan doc M4 — persisted on ctx (not just used once here) so renderOneClip (called later,
@@ -631,7 +639,7 @@ async function runPipeline(job, { url, uploadedPath, options }) {
     // the budget) are marked visionChecked=false so downstream logic/logs never conflate
     // "not checked" with "approved".
     job.status = 'selecting';
-    job.message = 'Validating top candidates...';
+    setStatus(job, 'Double-checking the top picks…', 'Making sure each moment looks right before cutting clips.');
     const autoCount = Math.min(AUTO_CLIP_COUNT, job.candidates.length);
     const visionT0 = Date.now();
     const checkBudgetCount = semantic.isAvailable() ? Math.min(semantic.VISION_BUDGET, job.candidates.length) : 0;
@@ -776,7 +784,7 @@ async function runPipeline(job, { url, uploadedPath, options }) {
 
     job._ctx = ctx; // kept alive for "generate more" requests
     job.status = 'done';
-    job.message = 'Done.';
+    setStatus(job, 'All done!', 'Your shorts are ready.');
   } catch (err) {
     job.status = 'error';
     job.message = err.message;

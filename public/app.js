@@ -13,6 +13,7 @@ tabs.forEach((tab) => {
 const generateBtn = document.getElementById('generate-btn');
 const statusCard = document.getElementById('status-card');
 const statusMessage = document.getElementById('status-message');
+const statusDetail = document.getElementById('status-detail');
 const statusProgressWrap = document.getElementById('status-progress-wrap');
 const statusProgress = document.getElementById('status-progress');
 const resultsCard = document.getElementById('results-card');
@@ -102,11 +103,11 @@ function labelForLength(sec) {
 }
 
 const STATUS_LABELS = {
-  pending: 'Waiting...',
-  'downloading clip': 'Downloading clip...',
-  'finding faces': 'Detecting people...',
-  'planning shot': 'Planning camera + effects...',
-  rendering: 'Rendering...',
+  pending: 'Waiting to start…',
+  'downloading clip': "Pulling in this clip's footage…",
+  'finding faces': 'Finding the right framing…',
+  'planning shot': 'Adding effects and punch-ins…',
+  rendering: 'Almost there — rendering your clip…',
 };
 
 function effectBadge(effect) {
@@ -160,7 +161,7 @@ function buildHookSection(entry, jobId) {
   wrap.className = 'hook-section';
 
   if (entry.hook === undefined) {
-    wrap.innerHTML = '<div class="hook-header">AI CAPTION</div><p class="hint">Analyzing the clip for a hook...</p>';
+    wrap.innerHTML = '<div class="hook-header">AI CAPTION</div><p class="hint">Adding the last touches…</p>';
     return wrap;
   }
 
@@ -474,11 +475,12 @@ async function pollJob(jobId, opts = {}) {
   const stillWorking = !job.results?.length || job.results.some((e) => (
     (e.status !== 'done' && e.status !== 'error') || (e.status === 'done' && e.hook === undefined)
   ));
-  const overallActive = job.status === 'downloading' || job.status === 'analyzing' || (job.status === 'rendering' && stillWorking);
+  const overallActive = job.status === 'downloading' || job.status === 'analyzing' || job.status === 'selecting' || (job.status === 'rendering' && stillWorking);
 
   if (overallActive && (!job.results || !job.results.length)) {
     statusCard.classList.remove('hidden');
     statusMessage.textContent = job.message || job.status;
+    statusDetail.textContent = job.detail || '';
     if (typeof job.progress === 'number') {
       statusProgressWrap.classList.remove('hidden');
       statusProgress.style.width = `${Math.min(100, job.progress)}%`;
@@ -507,7 +509,8 @@ async function startJob() {
   errorCard.classList.add('hidden');
   resultsGrid.innerHTML = '';
   statusProgressWrap.classList.add('hidden');
-  statusMessage.textContent = 'Starting...';
+  statusMessage.textContent = 'Getting things started…';
+  statusDetail.textContent = '';
   generateBtn.disabled = true;
 
   const captionTheme = document.getElementById('caption-theme').value;

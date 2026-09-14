@@ -447,6 +447,201 @@ function layoutsMatch(a, b) {
   return false;
 }
 
+// ============================================================================
+// Plan doc M9 — Editorial Shot Quality / Dead-Frame Rejection.
+//
+// A face merely existing must NOT be treated as equivalent to a good editorial shot.
+// Quality is a TIER with a fixed base; in-tier bonuses are capped so they can never cross
+// into the next tier — the separation between "a weak/fallback shot" and "a good speaker
+// shot" is a hard numeric gap, not an incidental side effect of additive scoring that could
+// let bonuses blur the two together.
+// ============================================================================
+const GOOD_FACE_AREA_FRAC = parseFloat(process.env.GOOD_FACE_AREA_FRAC || '0.05');
+const TINY_FACE_AREA_FRAC = parseFloat(process.env.TINY_FACE_AREA_FRAC || '0.015');
+const EDGE_DANGER_ZONE = parseFloat(process.env.EDGE_DANGER_ZONE || '0.12');
+const DEAD_FRAME_QUALITY_THRESHOLD = parseFloat(process.env.DEAD_FRAME_QUALITY_THRESHOLD || '0.20');
+const MIN_SHOT_HOLD_SEC = parseFloat(process.env.MIN_SHOT_HOLD_SEC || '2.5');
+const QUALITY_SWITCH_MARGIN = parseFloat(process.env.QUALITY_SWITCH_MARGIN || '0.12');
+const QUALITY_STRONG_UPGRADE_MARGIN = parseFloat(process.env.QUALITY_STRONG_UPGRADE_MARGIN || '0.30');
+const SPEAKER_HANDOFF_CONFIRM_CHUNKS = parseInt(process.env.SPEAKER_HANDOFF_CONFIRM_CHUNKS || '2', 10);
+const MIN_KEYFRAME_MOVEMENT = parseFloat(process.env.MIN_KEYFRAME_MOVEMENT || '0.02');
+const LOW_MOVEMENT_VARIANCE_THRESHOLD = parseFloat(process.env.LOW_MOVEMENT_VARIANCE_THRESHOLD || '0.05');
+const TIGHT_FRAMING_DZOOM = parseFloat(process.env.TIGHT_FRAMING_DZOOM || '0.85');
+// A 'fit' layout with 3+ real detected faces is NOT the same thing as a 'fit' fallback that
+// gave up on a single edge-proximate face (pickBaseLayout only reaches 'fit' with 1-2 faces
+// when a crop attempt failed/wasn't attempted) — it's a deliberate wide shot of a genuine
+// multi-person scene (e.g. a panel/group cutaway the source itself cut to). Confirmed via
+// real-video validation this session: without this distinction, a real, sustained group scene
+// could never win against a held single-speaker shot, no matter how long it persisted.
+const MIN_GROUP_SCENE_FACE_COUNT = 3;
+const GROUP_SCENE_CONFIRM_CHUNKS = parseInt(process.env.GROUP_SCENE_CONFIRM_CHUNKS || '2', 10);
+
+// Fixed base per tier, and a hard ceiling in-tier bonuses can never cross — this IS the
+// mechanism that guarantees a weak/fallback/fit shot cannot "easily beat" a good speaker
+// shot, not a hope resting on tuned weights. 'group-wide' sits above the "gave up" fallback
+// tier (it's real, deliberate content, not a failure) but structurally below 'good-speaker' —
+// a genuine group scene still can't win an ORDINARY quality-margin contest against a good
+// speaker shot; it earns a switch only via the sustained-scene-change gate below (§ same
+// "single blip isn't enough" pattern as the speaker handoff), never via raw quality alone.
+const TIER_QUALITY = { 'dead-empty': 0.05, 'fallback-wide': 0.30, 'group-wide': 0.55, 'weak-edge-tiny': 0.45, 'good-speaker': 0.75 };
+const TIER_CEILING = { 'dead-empty': 0.05, 'fallback-wide': 0.30, 'group-wide': 0.55, 'weak-edge-tiny': 0.65, 'good-speaker': 0.95 };
+// A confirmed speaker handoff only overrides ordinary hold/margin rules once the candidate
+// is ALSO 'good-speaker' tier — correct speaker identity alone must never override the basic
+// editorial-quality safety gate (a candidate can be the right person with terrible framing).
+const SPEAKER_HANDOFF_MIN_QUALITY = TIER_QUALITY['good-speaker'];
+
+// A slot with no size data at all (a bare {cx,cy} fallback, no w/h ever detected) is never
+// "good" by default — it carries no evidence it's actually a well-framed subject. Tiny or
+// edge-hugging slots are the same tier: both are shots a human editor would consider weak,
+// even though the DETECTOR technically found "a face."
+function classifySlotTier(slot) {
+  if (!slot) return 'dead-empty';
+  const area = (slot.w || 0) * (slot.h || 0);
+  const cx = slot.cx ?? 0.5;
+  const edgeDist = Math.min(cx, 1 - cx);
+  const noSizeData = area === 0;
+  if (noSizeData || area < TINY_FACE_AREA_FRAC || edgeDist < EDGE_DANGER_ZONE) return 'weak-edge-tiny';
+  return 'good-speaker';
+}
+
+function isConfidentlyActiveSpeaker(slot) {
+  return slot?.speakingScore != null
+    && slot.speakingConfidence >= REACTION_CUTAWAY_MIN_SPEAKING_CONFIDENCE
+    && slot.speakingScore >= REACTION_CUTAWAY_SPEAKER_THRESHOLD;
+}
+
+// Bonuses (fresh landmark data, active-speaker signal) nudge WITHIN a tier but are hard-capped
+// at that tier's ceiling — they can never lift a weak/tiny/edge slot into "good speaker"
+// territory, and can never be needed to keep a fallback/fit shot down (fit never reaches here
+// at all — see scoreLayoutQuality).
+function scoreSlotQuality(slot) {
+  if (!slot) return TIER_QUALITY['dead-empty'];
+  const tier = classifySlotTier(slot);
+  const base = TIER_QUALITY[tier];
+  const ceiling = TIER_CEILING[tier];
+  let bonus = 0;
+  if (slot.landmarkBox) bonus += 0.05;
+  if (isConfidentlyActiveSpeaker(slot)) bonus += (slot.speakingScore || 0) * 0.15;
+  return Math.min(ceiling, base + bonus);
+}
+
+// The single entry point for "how good is this layout as an editorial shot" — used by the
+// hold/switch decision below and by the protective-wide/tight framing decision (§2b). `fit`
+// is scored WITHOUT ever calling scoreSlotQuality (it has no slot), which is what
+// structurally guarantees a wide/fallback shot can never accidentally read as "good" via
+// bonus creep: there is no bonus path available to it at all.
+function scoreLayoutQuality(layout, people) {
+  if (!layout) return TIER_QUALITY['dead-empty'];
+  if (layout.type === 'fit') {
+    const faceCount = people?.faceCount || 0;
+    if (faceCount >= MIN_GROUP_SCENE_FACE_COUNT) return TIER_QUALITY['group-wide'];
+    return faceCount > 0 ? TIER_QUALITY['fallback-wide'] : TIER_QUALITY['dead-empty'];
+  }
+  if (layout.type === 'split') return Math.min(...layout.slots.map(scoreSlotQuality));
+  if (layout.type === 'single') return scoreSlotQuality(layout.slot);
+  if (layout.type === 'reaction-split' || layout.type === 'reaction-inset') return scoreSlotQuality(layout.faceBox);
+  return TIER_QUALITY['weak-edge-tiny'];
+}
+
+function primarySlotOf(layout) {
+  if (!layout) return null;
+  if (layout.type === 'single') return layout.slot;
+  if (layout.type === 'reaction-split' || layout.type === 'reaction-inset') return layout.faceBox;
+  return null; // 'split'/'fit' have no single "framed subject" to compare identity against
+}
+
+// Is the CANDIDATE layout a confident active speaker who reads as a DIFFERENT person than
+// whoever the current run is framing? Reuses only existing speakingScore/speakingConfidence
+// fields — no new detection. If the current run's own subject is ALSO a confident active
+// speaker (both genuinely mid-speech, e.g. brief overlap), only counts as a handoff when
+// their positions are far enough apart to plausibly be different people (same distance
+// threshold layoutsMatch already uses for "different shot").
+function candidateLooksLikeSpeakerHandoff(currentLayout, candidateLayout) {
+  const candidateSlot = primarySlotOf(candidateLayout);
+  if (!isConfidentlyActiveSpeaker(candidateSlot)) return false;
+  const currentSlot = primarySlotOf(currentLayout);
+  if (isConfidentlyActiveSpeaker(currentSlot)) {
+    return Math.abs((currentSlot.cx ?? 0.5) - (candidateSlot.cx ?? 0.5)) > 0.15;
+  }
+  return true;
+}
+
+// Sustained-confirmation gate for a speaker handoff — mirrors nextReactorHysteresisState's
+// pendingStreak/CONFIRM_CHUNKS pattern (M3) exactly, applied here to base-layout speaker
+// identity instead of reactor-within-facecam identity. A single noisy speakingScore spike
+// only ever sets streak:1 (confirmed:false); only SPEAKER_HANDOFF_CONFIRM_CHUNKS consecutive
+// agreeing chunks confirm a real handoff — this is what prevents woman/man ping-pong from
+// mere score alternation.
+function nextSpeakerHandoffState(state, candidateLooksLikeHandoff) {
+  const streak = candidateLooksLikeHandoff ? (state?.streak || 0) + 1 : 0;
+  return { streak, confirmed: streak >= SPEAKER_HANDOFF_CONFIRM_CHUNKS };
+}
+
+// Is this candidate a genuine multi-person group/panel scene (not a single-face "gave up"
+// fallback)? See the 'group-wide' tier comment above for why this needs its own signal.
+function candidateLooksLikeGenuineGroupScene(candidateLayout, candidatePeople) {
+  return candidateLayout?.type === 'fit' && (candidatePeople?.faceCount || 0) >= MIN_GROUP_SCENE_FACE_COUNT;
+}
+
+// Same sustained-evidence pattern as nextSpeakerHandoffState, generalized to "the source
+// itself cut to a different real scene" instead of "a different speaker is now talking." A
+// single stray 3-face detection amid an otherwise-good single-speaker run only ever sets
+// streak:1 (confirmed:false) and is held/absorbed like any other noisy chunk; only a real,
+// sustained (GROUP_SCENE_CONFIRM_CHUNKS consecutive) group scene earns the override below.
+function nextGroupSceneState(state, looksLikeGroupScene) {
+  const streak = looksLikeGroupScene ? (state?.streak || 0) + 1 : 0;
+  return { streak, confirmed: streak >= GROUP_SCENE_CONFIRM_CHUNKS };
+}
+
+// The core editorial decision: does this candidate chunk's layout deserve to replace the
+// current held shot? The default is HOLD (switching is always the exception that must earn
+// one of three explicit gates) — this is a stated rule, not an incidental fallthrough.
+// `currentRun` needs {layout, quality, start}; `candidateChunk` needs {layout, start}.
+function decideShotTransition(currentRun, candidateChunk, peopleForCandidate, speakerHandoffState, groupSceneState) {
+  const candidateQuality = scoreLayoutQuality(candidateChunk.layout, peopleForCandidate);
+  const currentQuality = currentRun.quality;
+
+  // (1) HARD SAFETY GATE, evaluated FIRST, before anything speaker-related: a confirmed
+  // speaker handoff must NEVER be allowed to force a switch into a dead/empty/fallback-
+  // invalid candidate. Speaker identity and shot quality are independent — the correct
+  // speaker can still have terrible composition, and that must not bypass this gate.
+  if (candidateQuality < DEAD_FRAME_QUALITY_THRESHOLD && currentQuality >= DEAD_FRAME_QUALITY_THRESHOLD) {
+    return { switch: false, reason: 'reject-dead-frame' };
+  }
+
+  // (2) Speaker handoff requires BOTH sustained/confident evidence AND an editorially
+  // acceptable composition for the new speaker — "speaker changed" alone is never enough. A
+  // confirmed handoff to a still-weak/tiny/edge candidate does NOT switch; it falls through
+  // to the ordinary rules below like anything else. Once both hold, the handoff switches
+  // even if the raw quality margin vs. the current shot is small — correct subject matters
+  // more than a marginal quality delta here.
+  if (speakerHandoffState.confirmed && candidateQuality >= SPEAKER_HANDOFF_MIN_QUALITY) {
+    return { switch: true, reason: 'speaker-handoff' };
+  }
+
+  // (2b) A sustained, confirmed genuine multi-person group/panel scene (never a single stray
+  // 3-face chunk — see nextGroupSceneState) also earns a switch even without clearing the
+  // ordinary quality margin below: this is "the source cut to different real content," a
+  // qualitatively different question from "is this candidate a higher-quality shot," and the
+  // group-wide tier's ceiling still keeps it structurally below good-speaker so it can never
+  // be confused with a degraded/fallback shot sneaking through.
+  if (groupSceneState?.confirmed && candidateQuality >= TIER_QUALITY['group-wide']) {
+    return { switch: true, reason: 'group-scene-change' };
+  }
+
+  // (3) Strong quality upgrade overrides the hold timer (unrelated to speaker identity).
+  const runDurationSoFar = candidateChunk.start - currentRun.start;
+  if (candidateQuality - currentQuality >= QUALITY_STRONG_UPGRADE_MARGIN) return { switch: true, reason: 'strong-upgrade' };
+  // (4) Minimum hold — a floor, not a cut-rate dial: clearing it is necessary but never
+  // sufficient on its own (the quality-margin check below still applies independently).
+  if (runDurationSoFar < MIN_SHOT_HOLD_SEC) return { switch: false, reason: 'min-hold' };
+  // (5) Ordinary quality-margin switch, only after the hold floor has cleared.
+  if (candidateQuality - currentQuality >= QUALITY_SWITCH_MARGIN) return { switch: true, reason: 'quality-margin' };
+
+  // (6) Otherwise: HOLD. This is the default, not an edge case.
+  return { switch: false, reason: 'not-materially-better' };
+}
+
 // Plan doc M3 — mirrors facedetect.js:detectLayoutTimeline's own pendingTopology/
 // pendingStreak/CONFIRM_CHUNKS hysteresis (which gates FACE-COUNT/topology changes),
 // applied here to a different, previously memoryless decision: WHICH detected face inside a
@@ -508,14 +703,49 @@ function buildLayoutSegments(layoutTimeline, srcW, srcH, reactionComposite, outW
     const layout = finalizeLayoutWithCropValidation(pickBaseLayout(c.people, srcW, srcH, reactionComposite, outW, outH, emotionalImportance, opts), srcW, srcH, outW, outH);
     return { start: c.start, end: c.end, layout, people: c.people };
   });
+  // Plan doc M9 — the merge decision now goes through decideShotTransition (quality/hold/
+  // speaker-handoff aware) rather than treating every layoutsMatch-false transition as an
+  // equally legitimate cut. layoutsMatch stays as the existing fast path — "obviously the
+  // same shot" chunks merge exactly as before, with no quality lookup needed at all. Only a
+  // genuinely different-position transition goes through the new decision.
   const merged = [];
+  let speakerHandoffState = { streak: 0, confirmed: false };
+  let groupSceneState = { streak: 0, confirmed: false };
   for (const seg of raw) {
     const prev = merged[merged.length - 1];
-    if (prev && layoutsMatch(prev.layout, seg.layout)) {
+    if (!prev) {
+      merged.push({ start: seg.start, end: seg.end, layout: seg.layout, chunks: [seg], quality: scoreLayoutQuality(seg.layout, seg.people) });
+      continue;
+    }
+    if (layoutsMatch(prev.layout, seg.layout)) {
       prev.end = seg.end;
       prev.chunks.push(seg);
+      // Anchor the run's held quality to the BEST chunk seen in it, not its worst sampled
+      // instant, so a single noisy dip within an otherwise-good run can't drag down how
+      // strong a case a later candidate needs to make to replace it.
+      prev.quality = Math.max(prev.quality, scoreLayoutQuality(seg.layout, seg.people));
+      speakerHandoffState = { streak: 0, confirmed: false };
+      groupSceneState = { streak: 0, confirmed: false };
+      continue;
+    }
+
+    const looksLikeHandoff = candidateLooksLikeSpeakerHandoff(prev.layout, seg.layout);
+    speakerHandoffState = nextSpeakerHandoffState(speakerHandoffState, looksLikeHandoff);
+    const looksLikeGroupScene = candidateLooksLikeGenuineGroupScene(seg.layout, seg.people);
+    groupSceneState = nextGroupSceneState(groupSceneState, looksLikeGroupScene);
+    const decision = decideShotTransition(prev, seg, seg.people, speakerHandoffState, groupSceneState);
+
+    if (decision.switch) {
+      merged.push({ start: seg.start, end: seg.end, layout: seg.layout, chunks: [seg], quality: scoreLayoutQuality(seg.layout, seg.people) });
+      speakerHandoffState = { streak: 0, confirmed: false };
+      groupSceneState = { streak: 0, confirmed: false };
     } else {
-      merged.push({ start: seg.start, end: seg.end, layout: seg.layout, chunks: [seg] });
+      // HOLD: absorb this chunk's time into the current run using the CURRENT run's layout
+      // (not the candidate's) — the chunk's own `people` data is preserved untouched, so
+      // M4's reaction-cutaway detection (which reads chunk.people directly) is completely
+      // unaffected by a held-over chunk.
+      prev.end = seg.end;
+      prev.chunks.push({ ...seg, layout: prev.layout, heldOver: true });
     }
   }
 
@@ -527,6 +757,16 @@ function buildLayoutSegments(layoutTimeline, srcW, srcH, reactionComposite, outW
   for (const run of merged) {
     const kf = buildKeyframesForRun(run, srcW, srcH, outW, outH);
     if (kf) run.layout = { ...run.layout, keyframes: kf.keyframes, keyframeSize: { w: kf.fixedW, h: kf.fixedH } };
+  }
+
+  // Plan doc M9 §2b — selective, reversible tightening for a clearly-stationary, well-framed
+  // single-speaker run that did NOT end up animated (a run that DID get keyframes already
+  // showed meaningful movement, which is exactly the condition that keeps it protective-wide
+  // instead of tightened — see maybeTightenStableShot).
+  for (const run of merged) {
+    if (!run.layout.keyframes) {
+      run.layout = maybeTightenStableShot(run, srcW, srcH, outW, outH);
+    }
   }
 
   return merged;
@@ -607,8 +847,71 @@ function buildKeyframesForRun(run, srcW, srcH, outW, outH) {
     if (!validateFaceCrop(p.landmarkBox, { x, y, w: fixedW, h: fixedH }).ok) return null;
   }
 
-  const keyframes = run.chunks.map((c, i) => ({ t: c.start - run.start, cx: positions[i].cx, cy: positions[i].cy }));
+  // Plan doc M9 §3 — edge-quality re-check, independent of landmark presence. validateFaceCrop
+  // above only checks that the LANDMARK stays inside the crop with a margin, and skips
+  // entirely when there's no landmark data (a carried-forward/fallback position) — exactly
+  // the loophole that could let an edge-hugging pan through unnoticed. This closes it for
+  // EVERY keyframe position regardless of landmark presence: if any position sits in the
+  // edge-danger zone, the whole run falls back to today's static-per-run behavior rather than
+  // animating toward/through an unsafe position.
+  for (const p of positions) {
+    const edgeDist = Math.min(p.cx, 1 - p.cx);
+    if (edgeDist < EDGE_DANGER_ZONE) return null;
+  }
+
+  // Plan doc M9 §3 — meaningful-movement filter: "do not create a keyframe simply because
+  // the face moved slightly." Collapses consecutive positions whose movement is below
+  // MIN_KEYFRAME_MOVEMENT into one. If every position collapses to a single point, the run
+  // ends up with keyframes.length < 2 and renders as today's exact static crop — no
+  // render.js change needed, since layout.keyframes.length >= 2 is already the sole
+  // animation gate there.
+  const rawKeyframes = run.chunks.map((c, i) => ({ t: c.start - run.start, cx: positions[i].cx, cy: positions[i].cy }));
+  const keyframes = [rawKeyframes[0]];
+  for (let i = 1; i < rawKeyframes.length; i++) {
+    const last = keyframes[keyframes.length - 1];
+    const kf = rawKeyframes[i];
+    const moved = Math.abs(kf.cx - last.cx) >= MIN_KEYFRAME_MOVEMENT || Math.abs(kf.cy - last.cy) >= MIN_KEYFRAME_MOVEMENT;
+    if (moved) keyframes.push(kf);
+  }
+
   return { keyframes, fixedW, fixedH };
+}
+
+// Plan doc M9 §2b — movement variance for a run: the max positional spread (cx or cy) across
+// its own chunks. Shares keyframePositionForChunk with buildKeyframesForRun above so the
+// tightening decision below and the keyframe machinery can never disagree about whether a
+// run "has movement" — one signal, two consumers, never two independent opinions.
+function computeRunPositionVariance(run) {
+  const layoutType = run.layout?.type;
+  if (layoutType !== 'single' && layoutType !== 'reaction-split' && layoutType !== 'reaction-inset') return 0;
+  const positions = (run.chunks || []).map((c) => keyframePositionForChunk(c, layoutType)).filter(Boolean);
+  if (positions.length < 2) return 0;
+  const cxs = positions.map((p) => p.cx);
+  const cys = positions.map((p) => p.cy);
+  return Math.max(Math.max(...cxs) - Math.min(...cxs), Math.max(...cys) - Math.min(...cys));
+}
+
+// Plan doc M9 §2b — selective, reversible tightening for a clearly-stationary, well-framed
+// single-speaker run. Today's default auto-generated 'single' crop (no manualCrop) already
+// uses the maximal available height (cropBoxFor) — the widest, most movement-protective
+// framing geometrically possible — so there is no "wider than default" mode to add; the
+// missing piece is an OPTIONAL, safe tightening for the specific case where the speaker
+// isn't moving and is already well-framed. Reuses the exact applyCropAdjust +
+// finalizeLayoutWithCropValidation mechanism M6's punch-in already proved safe: if the
+// tightened candidate fails crop validation for any reason, the untouched, already-safe,
+// already-protective original layout is returned — this can only ever succeed or no-op,
+// never produce a worse crop than today's default.
+function maybeTightenStableShot(run, srcW, srcH, outW, outH) {
+  if (run.layout?.type !== 'single' || run.layout.manualCrop) return run.layout;
+  if (run.quality < TIER_QUALITY['good-speaker']) return run.layout;
+  if (computeRunPositionVariance(run) >= LOW_MOVEMENT_VARIANCE_THRESHOLD) return run.layout;
+
+  const zoomedSlot = applyCropAdjust(run.layout.slot, { dzoom: TIGHT_FRAMING_DZOOM });
+  const tightened = finalizeLayoutWithCropValidation(
+    { type: 'single', slot: zoomedSlot, manualCrop: zoomedSlot, manualCropMargin: DEFAULT_MANUAL_CROP_MARGIN },
+    srcW, srcH, outW, outH
+  );
+  return tightened.type === 'single' ? tightened : run.layout;
 }
 
 // Builds the segment list for a clip. The base is a layout TIMELINE (full/single/split, or
@@ -1085,4 +1388,8 @@ module.exports = {
   selectReactionCutaways, isEditoriallyRelevantReaction,
   applyEditorialEmphasis, shouldPunchInReaction, tryPunchIn, applyRateWindow, findSustainedHighEnergyWindow,
   buildKeyframesForRun,
+  classifySlotTier, scoreSlotQuality, scoreLayoutQuality, isConfidentlyActiveSpeaker,
+  candidateLooksLikeSpeakerHandoff, nextSpeakerHandoffState, decideShotTransition,
+  candidateLooksLikeGenuineGroupScene, nextGroupSceneState,
+  computeRunPositionVariance, maybeTightenStableShot,
 };

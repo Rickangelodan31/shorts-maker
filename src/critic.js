@@ -49,6 +49,8 @@ check:
   moment) — or is it a flat, uneventful stretch with nothing happening?
 - Is the correct/most relevant person visible and in frame for the moments that matter?
 - Is any face awkwardly cropped, cut off, or otherwise obscured?
+- Is there a sustained shot of mostly empty background/table/wall with no visible subject,
+  when the source clearly has a person available to show instead?
 - Is there a large stretch of dead air/silence with nothing happening on screen?
 - Are captions (if visible in the frames) legible and not obscuring something important?
 - Is anything visually broken or clearly wrong (a garbled/black frame, a wildly wrong crop)?
